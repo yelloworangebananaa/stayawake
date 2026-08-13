@@ -24,10 +24,10 @@ _name_of() { case "$1" in 2000) echo sh ;; 2001) echo bash ;; 2002) echo python 
 
 assert_eq "$(find_claude_pid 2000)" "2001" "falls back when claude is at level 7 (past 6-level cap)"
 
-# Test PID 1 boundary - PID 1 is resolvable but walker should stop there
+# Test PID 1 boundary - PID 1 has a name matching claude but walker should stop before testing
 _ppid_of() { case "$1" in 3000) echo 3001 ;; 3001) echo 1 ;; 1) echo 0 ;; *) echo 1 ;; esac; }
-_name_of() { case "$1" in 3000) echo sh ;; 3001) echo bash ;; 1) echo init ;; 0) echo kernel ;; *) echo init ;; esac; }
+_name_of() { case "$1" in 3000) echo sh ;; 3001) echo bash ;; 1) echo claude-init ;; 0) echo kernel ;; *) echo init ;; esac; }
 
-assert_eq "$(find_claude_pid 3000)" "3001" "stops at PID 1 boundary even when resolvable"
+assert_eq "$(find_claude_pid 3000)" "3001" "stops at PID 1 boundary even when name matches"
 
 finish

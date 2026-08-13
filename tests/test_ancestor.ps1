@@ -49,15 +49,15 @@ $deep7Lookup = { param($id) if ($deep7.ContainsKey($id)) { return $deep7[$id] } 
 Assert-Eq -Actual (Find-ClaudePid -StartPid 2000 -Lookup $deep7Lookup) -Expected 2001 `
           -Name 'falls back when claude is at level 7 (past 6-level cap)'
 
-# Test PID 1 boundary - resolvable but walker should stop there
+# Test PID 1 boundary - PID 1 has a name matching claude but walker should stop before testing
 $pid1boundary = @{
   3000 = @{ Parent = 3001; Name = 'powershell' }
   3001 = @{ Parent = 1;    Name = 'bash' }
-  1    = @{ Parent = 0;    Name = 'init' }
+  1    = @{ Parent = 0;    Name = 'claude-init' }
 }
 $pid1Lookup = { param($id) if ($pid1boundary.ContainsKey($id)) { return $pid1boundary[$id] } else { return $null } }
 
 Assert-Eq -Actual (Find-ClaudePid -StartPid 3000 -Lookup $pid1Lookup) -Expected 3001 `
-          -Name 'stops at PID 1 boundary even when resolvable'
+          -Name 'stops at PID 1 boundary even when name matches'
 
 Complete-Tests

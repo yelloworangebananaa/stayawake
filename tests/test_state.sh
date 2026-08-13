@@ -30,6 +30,43 @@ _sa_rc=$(
 assert_eq "$_sa_rc" "2" "write failure (unwritable parent) returns 2, not 1"
 rm -f "$_sa_blocker"
 
+# --- guards directory unusable: _ensure_dirs fails, claim must not proceed ---
+# "guards" exists as a regular file, so mkdir -p on it fails. Before the
+# `_ensure_dirs || return 2` fix, claim_baseline ignored that failure and
+# went on to write the baseline anyway, returning 0 -- telling the caller it
+# was safe to mutate power settings even though no guard could ever be
+# registered to release them later.
+_sa_guards_home="${TMPDIR:-/tmp}/sa-guardsfile-$$"
+rm -rf "$_sa_guards_home"
+mkdir -p "$_sa_guards_home"
+: > "$_sa_guards_home/guards"
+_sa_rc=$(
+  STAYAWAKE_HOME="$_sa_guards_home"
+  export STAYAWAKE_HOME
+  claim_baseline "x"
+  echo "$?"
+)
+assert_eq "$_sa_rc" "2" "guards dir unusable (regular file) returns 2, not 0"
+rm -rf "$_sa_guards_home"
+
+# --- empty baseline is a partial write, not a valid claim to proceed from ---
+# A zero-byte original.state means the create succeeded but the data write
+# didn't. Before the `[ -s ... ]` fix (was `[ -f ... ]`), this looked like
+# "already exists" and returned 1 (safe to proceed) -- but proceeding means
+# restoring from nothing.
+_sa_empty_home="${TMPDIR:-/tmp}/sa-emptybaseline-$$"
+rm -rf "$_sa_empty_home"
+mkdir -p "$_sa_empty_home"
+: > "$_sa_empty_home/original.state"
+_sa_rc=$(
+  STAYAWAKE_HOME="$_sa_empty_home"
+  export STAYAWAKE_HOME
+  claim_baseline "x"
+  echo "$?"
+)
+assert_eq "$_sa_rc" "2" "empty baseline file returns 2, not 1"
+rm -rf "$_sa_empty_home"
+
 # --- refcount ---
 assert_eq "$(guard_count)" "0" "no guards at start"
 guard_register "sess-a" "turn" "$$" "$$"

@@ -24,15 +24,24 @@ function Get-LidActionFromText {
   }
 }
 
-# Win32_Battery BatteryStatus: 1 means discharging. Everything else means
+# Win32_Battery BatteryStatus: 1 = Discharging, 4 = Low (discharging), 5 =
+# Critical (discharging) all mean "on battery". 2 = AC, 3 = Fully charged,
+# 6-9 = Charging (various), 10 = Undefined, 11 = Partially charged all mean
 # mains power is present. A machine with no battery is always on mains.
+#
+# Where this mapping is ambiguous, err toward 'battery': that direction
+# releases the lid override and lets the machine sleep, which is the safe
+# failure. Erring toward 'ac' keeps a machine awake that should have been
+# allowed to sleep (and, worse, disables the battery-floor safety valve on
+# exactly the low/critical statuses it exists to catch). Do not "simplify"
+# this back to a single discharging value.
 function Get-PowerSourceFromStatus {
   param([int]$BatteryStatus, [int]$ChargePercent, [bool]$HasBattery)
   if (-not $HasBattery) {
     return [pscustomobject]@{ Source = 'ac'; Percent = 100 }
   }
   $src = 'ac'
-  if ($BatteryStatus -eq 1) { $src = 'battery' }
+  if ($BatteryStatus -eq 1 -or $BatteryStatus -eq 4 -or $BatteryStatus -eq 5) { $src = 'battery' }
   return [pscustomobject]@{ Source = $src; Percent = $ChargePercent }
 }
 

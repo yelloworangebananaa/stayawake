@@ -17,6 +17,23 @@ $bat = Get-PowerSourceFromStatus -BatteryStatus 1 -ChargePercent 23 -HasBattery 
 Assert-Eq -Actual $bat.Source -Expected 'battery' -Name 'BatteryStatus 1 is battery'
 Assert-Eq -Actual $bat.Percent -Expected 23 -Name 'charge percent passed through'
 
+# BatteryStatus 4 (Low) and 5 (Critical) are discharging states, same as 1.
+# The old code mapped everything except 1 to 'ac', so a laptop draining
+# toward empty on status 4/5 reported 'ac' and the battery floor never
+# engaged. These pin the fix.
+$low = Get-PowerSourceFromStatus -BatteryStatus 4 -ChargePercent 12 -HasBattery $true
+Assert-Eq -Actual $low.Source -Expected 'battery' -Name 'BatteryStatus 4 (Low) is battery'
+Assert-Eq -Actual $low.Percent -Expected 12 -Name 'BatteryStatus 4 charge percent passed through'
+
+$crit = Get-PowerSourceFromStatus -BatteryStatus 5 -ChargePercent 4 -HasBattery $true
+Assert-Eq -Actual $crit.Source -Expected 'battery' -Name 'BatteryStatus 5 (Critical) is battery'
+Assert-Eq -Actual $crit.Percent -Expected 4 -Name 'BatteryStatus 5 charge percent passed through'
+
+# Pin the other side: fully charged (3) must stay 'ac'. Catches a future
+# over-correction that maps everything to 'battery'.
+$full = Get-PowerSourceFromStatus -BatteryStatus 3 -ChargePercent 100 -HasBattery $true
+Assert-Eq -Actual $full.Source -Expected 'ac' -Name 'BatteryStatus 3 (Fully charged) is ac'
+
 $desk = Get-PowerSourceFromStatus -BatteryStatus 0 -ChargePercent 0 -HasBattery $false
 Assert-Eq -Actual $desk.Source -Expected 'ac' -Name 'no battery means AC'
 Assert-Eq -Actual $desk.Percent -Expected 100 -Name 'no battery reports 100 percent'

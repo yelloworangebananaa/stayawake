@@ -32,11 +32,14 @@ _ensure_dirs() {
 #       written. Caller MUST NOT proceed to mutate power settings on 2 —
 #       there would be nothing to restore from.
 claim_baseline() { # text
-  _ensure_dirs
+  _ensure_dirs || return 2
   if ( set -C; printf '%s\n' "$1" > "$(baseline_file)" ) 2>/dev/null; then
     return 0
   fi
-  [ -f "$(baseline_file)" ] && return 1
+  # -s (exists and non-empty) rather than -f: an existing-but-empty baseline
+  # is a partial write (create succeeded, data write didn't) and must be
+  # treated as a failed claim, not a valid one to proceed from.
+  [ -s "$(baseline_file)" ] && return 1
   return 2
 }
 
