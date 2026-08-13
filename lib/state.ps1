@@ -63,17 +63,37 @@ function Read-Baseline {
   return ([System.IO.File]::ReadAllText($f)).Trim()
 }
 
+# STAYAWAKE_HOME is a caller-supplied override and can point anywhere,
+# including under a %TEMP% that Windows expanded to its 8.3 short-name form
+# (this happens whenever the profile directory name contains a space, e.g.
+# "RYZEN9~1" for "ryzen 9" -- a completely normal, common Windows setup).
+# Test-Path/New-Item/Get-ChildItem/Get-Item all resolve such paths fine, but
+# Move-Item and Remove-Item do not -- they throw PSArgumentException
+# "An object at the specified path ... does not exist" on the literal short
+# form even though the target is real. Get-Item resolves it once; every
+# provider-cmdlet call in this file that touches a caller-derived path goes
+# through a value returned by Get-Item/Get-ChildItem, never the raw one.
 function Clear-Baseline {
   $f = Get-BaselineFile
-  if (Test-Path $f) { Remove-Item $f -Force }
+  if (Test-Path $f) {
+    Remove-Item (Get-Item $f).FullName -Force -ErrorAction Stop
+  }
 }
 
 # Writes to a temp file in the SAME directory as the destination, then
-# Move-Item -Force's it into place. On NTFS, Move-Item -Force onto an
-# existing/absent destination maps to MoveFileEx with
-# MOVEFILE_REPLACE_EXISTING, which is atomic -- a guard file is never
-# observable mid-write. A force-kill between the write and the move just
-# leaves an orphan temp file, never a truncated/unparseable guard.
+# Move-Item -Force's it into place. The fresh-create case (no prior file at
+# $dest) is the atomic test-and-set that matters for crash safety: a
+# force-kill between the write and the move leaves an orphan temp file,
+# never a truncated/unparseable guard, because the destination is never
+# written in place. The re-register/overwrite case (a guard file for the
+# same session+kind already exists) is not guaranteed atomic the way POSIX
+# rename(2) is -- Windows PowerShell 5.1's Move-Item -Force may fall back to
+# delete-then-move when the destination exists. That's still crash-safe in
+# the same sense (destination is either the old full file, momentarily
+# absent, or the new full file -- never partial); it just isn't a single
+# atomic syscall. -ErrorAction Stop makes any failure here (including the
+# short-path trap above) a loud exception instead of a silently-swallowed
+# non-terminating error.
 #
 # The temp lives in the same directory on purpose: a temp elsewhere would
 # make the move a cross-volume copy, which is not atomic.
@@ -86,16 +106,19 @@ function Clear-Baseline {
 function Register-Guard {
   param([string]$SessionId, [string]$Kind, [int]$GuardPid, [int]$ParentPid)
   Initialize-StateDirs
-  $dest = Get-GuardFile -SessionId $SessionId -Kind $Kind
-  $tmp = Join-Path (Get-GuardsDir) ".tmp-$SessionId-$Kind-$PID"
-  Set-Content -Path $tmp -Value "guard_pid=$GuardPid`nparent_pid=$ParentPid" -Encoding utf8
-  Move-Item -Path $tmp -Destination $dest -Force
+  $guardsDirLong = (Get-Item (Get-GuardsDir)).FullName
+  $dest = Join-Path $guardsDirLong "$SessionId-$Kind"
+  $tmp = Join-Path $guardsDirLong ".tmp-$SessionId-$Kind-$PID"
+  Set-Content -Path $tmp -Value "guard_pid=$GuardPid`nparent_pid=$ParentPid" -Encoding utf8 -ErrorAction Stop
+  Move-Item -Path $tmp -Destination $dest -Force -ErrorAction Stop
 }
 
 function Unregister-Guard {
   param([string]$SessionId, [string]$Kind)
   $f = Get-GuardFile -SessionId $SessionId -Kind $Kind
-  if (Test-Path $f) { Remove-Item $f -Force }
+  if (Test-Path $f) {
+    Remove-Item (Get-Item $f).FullName -Force -ErrorAction Stop
+  }
 }
 
 function Get-GuardCount {
@@ -128,10 +151,21 @@ function Remove-DeadGuards {
   $d = Get-GuardsDir
   if (-not (Test-Path $d)) { return }
   foreach ($f in Get-ChildItem -Path $d -File | Where-Object { $_.Name -notlike '.tmp-*' }) {
-    $m = [regex]::Match((Get-Content $f.FullName -Raw), 'guard_pid=(\d+)')
+    # A zero-byte (or otherwise unreadable) file is the canonical unparseable
+    # guard file. Get-Content -Raw returns $null for an empty file, and
+    # [regex]::Match($null, ...) throws MethodInvocationException rather than
+    # just failing to match -- that would abort the whole loop and leave
+    # every remaining guard un-reaped. Treat "nothing read" as "skip it",
+    # same as sh's empty-var + continue.
+    $raw = Get-Content $f.FullName -Raw -ErrorAction SilentlyContinue
+    if (-not $raw) { continue }
+    # Anchored (and multiline) so a malformed line like "guard_pid=12abc"
+    # is skipped, not parsed as PID 12 -- matches sh's
+    # '^guard_pid=\([0-9][0-9]*\)$' instead of matching anywhere in the file.
+    $m = [regex]::Match($raw, '(?m)^guard_pid=(\d+)\r?$')
     if (-not $m.Success) { continue }
     if (-not (Test-PidAlive -ProcessId ([int]$m.Groups[1].Value))) {
-      Remove-Item $f.FullName -Force
+      Remove-Item $f.FullName -Force -ErrorAction Stop
     }
   }
 }
