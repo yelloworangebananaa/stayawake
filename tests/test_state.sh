@@ -147,6 +147,62 @@ assert_eq "$_sa_stale_rc" "0" "stale lock (dead pid) is broken and the command s
 assert_eq "$([ "$((_sa_t1 - _sa_t0))" -lt 3 ] && echo fast)" "fast" "stale lock was broken immediately, not waited out"
 assert_eq "$(ls "$STAYAWAKE_HOME/lock" 2>/dev/null)" "" "lock dir clean after the stale-lock run"
 
+# --- with_state_lock: concurrent breakers of the SAME stale lock never both win ---
+# Regression test for Critical 2 (rm -rf-by-path stale break): plants one
+# stale lock (dead pid) and releases 8 waiters at it simultaneously through a
+# start barrier, to maximize the chance more than one is mid-break at once.
+# `rm -rf` acting on a shared path let two waiters both judge the same dead
+# pid stale and both proceed -- the second's rm could hit a lock a third
+# process (or the first waiter) had already legitimately recreated at that
+# path. `mv` to a private per-process name before removing is what actually
+# closes it: only one racer's rename can ever succeed.
+#
+# STAYAWAKE_LOCK_MAX_WAIT is raised for this test on purpose: with 8 waiters
+# serializing 1s critical sections and no fairness/FIFO ordering, plain
+# queueing can legitimately need close to 8s for the last waiter to get a
+# turn -- that is a budget question (covered separately), not this race. A
+# tight budget here would fail the test on ordinary contention and mask the
+# actual bug (a waiter silently never running its command at all because its
+# freshly-acquired lock got deleted out from under it) behind an unrelated
+# timeout.
+STAYAWAKE_LOCK_MAX_WAIT=20
+export STAYAWAKE_LOCK_MAX_WAIT
+rm -rf "$STAYAWAKE_HOME"
+mkdir -p "$STAYAWAKE_HOME"
+_sa_out="$STAYAWAKE_HOME/order.log"
+: > "$_sa_out"
+_sa_go="$STAYAWAKE_HOME/go"
+mkdir -p "$STAYAWAKE_HOME/lock"
+printf '999999\n' > "$STAYAWAKE_HOME/lock/pid"
+
+_sa_i=0
+_sa_pids=""
+while [ "$_sa_i" -lt 8 ]; do
+  (
+    while [ ! -e "$_sa_go" ]; do :; done
+    with_state_lock sh -c 'printf "BEGIN %s\n" "$1" >> "$2"; sleep 1; printf "END %s\n" "$1" >> "$2"' _ "$_sa_i" "$_sa_out"
+  ) &
+  _sa_pids="$_sa_pids $!"
+  _sa_i=$((_sa_i + 1))
+done
+: > "$_sa_go"
+wait $_sa_pids
+unset STAYAWAKE_LOCK_MAX_WAIT
+
+_sa_open=""
+_sa_bad=0
+while read -r _sa_ev _sa_id; do
+  if [ "$_sa_ev" = "BEGIN" ]; then
+    [ -n "$_sa_open" ] && _sa_bad=1
+    _sa_open="$_sa_id"
+  else
+    [ "$_sa_open" = "$_sa_id" ] || _sa_bad=1
+    _sa_open=""
+  fi
+done < "$_sa_out"
+assert_eq "$(wc -l < "$_sa_out" | tr -d ' ')" "16" "stale-breaker race: all 8 waiters completed exactly one BEGIN/END pair"
+assert_eq "$_sa_bad" "0" "stale-breaker race: no two waiters were ever inside the critical section together"
+
 rm -rf "$STAYAWAKE_HOME"
 
 finish

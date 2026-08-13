@@ -36,6 +36,27 @@ _ensure_dirs() {
 # Stale-lock recovery is mandatory, not optional: a guard force-killed while
 # holding the lock must not wedge every future session forever. If the lock
 # exists and the PID recorded inside it is not alive, break it and retry.
+# Breaking is done by `mv` to a private per-process name before `rm -rf`,
+# never by `rm -rf` on the shared path directly: `rm -rf` acts on whatever
+# currently sits at that path, so if two waiters both judge the same dead
+# pid stale, both would `rm -rf` the SAME path, and the second's rm can hit
+# a lock a third process already legitimately recreated there -- deleting a
+# live holder, not the stale one either of them inspected. `mv` is atomic:
+# only one racer's rename can succeed (the source vanishes for everyone
+# else the instant it wins), so at most one process ever proceeds past a
+# given stale lock instance.
+#
+# Ownership is re-verified both right after acquiring (in case a lock we
+# just created was somehow broken as stale before we could stamp our own
+# pid into it -- the empty-holder rule below should already prevent that,
+# this is defense in depth) and again before releasing (in case our lock
+# was broken out from under us while we held it, e.g. we looked dead to a
+# waiter and got reaped by mistake). Never delete a lock whose pid isn't
+# our own; that lock belongs to someone else now.
+#
+# STAYAWAKE_LOCK_MAX_WAIT overrides the retry budget (seconds) for callers
+# where the default of a few seconds is too tight -- e.g. guard cleanup,
+# where timing out unlocked is far worse than waiting longer.
 #
 # ponytail: there is a narrow window between `mkdir` succeeding and the pid
 # file being written where a waiter sees an empty holder and cannot yet tell
@@ -47,12 +68,18 @@ with_state_lock() { # command [args...]
   _ensure_dirs || return 1
   _sa_ld="$(lock_dir)"
   _sa_waited=0
-  _sa_max_wait=5
+  _sa_max_wait="${STAYAWAKE_LOCK_MAX_WAIT:-5}"
   while :; do
-    mkdir "$_sa_ld" 2>/dev/null && break
+    if mkdir "$_sa_ld" 2>/dev/null; then
+      printf '%s\n' "$$" > "$_sa_ld/pid" 2>/dev/null
+      [ "$(cat "$_sa_ld/pid" 2>/dev/null)" = "$$" ] && break
+      continue
+    fi
     _sa_holder=$(cat "$_sa_ld/pid" 2>/dev/null)
     if [ -n "$_sa_holder" ] && ! _pid_alive "$_sa_holder"; then
-      rm -rf "$_sa_ld" 2>/dev/null
+      if mv "$_sa_ld" "$_sa_ld.stale.$$" 2>/dev/null; then
+        rm -rf "$_sa_ld.stale.$$" 2>/dev/null
+      fi
       continue
     fi
     if [ "$_sa_waited" -ge "$_sa_max_wait" ]; then
@@ -62,10 +89,9 @@ with_state_lock() { # command [args...]
     sleep 1
     _sa_waited=$((_sa_waited + 1))
   done
-  printf '%s\n' "$$" > "$_sa_ld/pid" 2>/dev/null
   "$@"
   _sa_rc=$?
-  rm -rf "$_sa_ld" 2>/dev/null
+  [ "$(cat "$_sa_ld/pid" 2>/dev/null)" = "$$" ] && rm -rf "$_sa_ld" 2>/dev/null
   return "$_sa_rc"
 }
 
