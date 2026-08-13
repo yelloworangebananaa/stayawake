@@ -1,0 +1,9 @@
+Power Scheme GUID: 64a64f24-65b9-4b56-befd-5ec1eaced9b3  (Power saver)
+  Subgroup GUID: 4f971e89-eebd-4455-a8de-9e59040e7347  (Power buttons and lid)
+    GUID Alias: SUB_BUTTONS
+    Power Setting GUID: a7066653-8d6c-40a8-910e-a1f54b84c7e5  (Start menu power button)
+      GUID Alias: UIBUTTON_ACTION
+      Possible Setting Index: 000
+      Possible Setting Friendly Name: Sleep
+    Current AC Power Setting Index: 0x00000000
+    Current DC Power Setting Index: 0x00000000

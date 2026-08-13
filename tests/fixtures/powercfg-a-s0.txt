@@ -1,0 +1,8 @@
+The following sleep states are available on this system:
+    Standby (S0 Low Power Idle)
+    Hibernate
+    Fast Startup
+
+The following sleep states are not available on this system:
+    Standby (S3)
+	The system firmware does not support this standby state.
