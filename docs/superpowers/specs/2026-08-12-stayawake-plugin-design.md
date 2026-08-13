@@ -21,6 +21,20 @@ setting it changed when the work ends.
    a force-killed terminal, or a power loss.
 4. Installable via `/plugin marketplace add` + `/plugin install`. No runtime dependencies.
 
+## Success criteria
+
+The plugin is done when, with protection active, a request Claude is working on runs to
+completion regardless of the lid being closed or the idle timer expiring — on both macOS
+and Windows — and every changed setting is back to its original value afterwards.
+
+Two exceptions are by design and must be reported to the user rather than silently
+tolerated:
+
+- Battery below `batteryFloor` on battery power: the guard releases and the machine
+  sleeps. The request does not finish. This is the chosen safety valve.
+- Windows machines whose firmware overrides `LIDACTION` under Modern Standby: lid-close
+  coverage is unavailable and `setup` says so. Idle-sleep blocking still works there.
+
 ## Non-goals
 
 - Session resurrection or auto-resume after a session dies anyway. Different problem.
