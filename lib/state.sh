@@ -16,8 +16,57 @@ baseline_file() {
   printf '%s/original.state' "$(state_dir)"
 }
 
+lock_dir() {
+  printf '%s/lock' "$(state_dir)"
+}
+
 _ensure_dirs() {
   mkdir -p "$(guards_dir)" 2>/dev/null
+}
+
+# Serializes the guard's two critical sections (startup claim+register,
+# cleanup unregister+reap+restore) across processes so the read-then-act
+# sequences over guard files and the baseline can never interleave.
+#
+# mkdir is the primitive: it is atomic on every platform this targets, same
+# guarantee `set -C` gives claim_baseline over a plain file. A lock is a
+# directory rather than a data file on purpose -- it can never be confused
+# with baseline/guard data.
+#
+# Stale-lock recovery is mandatory, not optional: a guard force-killed while
+# holding the lock must not wedge every future session forever. If the lock
+# exists and the PID recorded inside it is not alive, break it and retry.
+#
+# ponytail: there is a narrow window between `mkdir` succeeding and the pid
+# file being written where a waiter sees an empty holder and cannot yet tell
+# live from stale. It just keeps waiting (never breaks a lock it can't prove
+# is stale) and times out safely if that holder really did die in that exact
+# instant -- fails loud, never proceeds unlocked. Not worth closing for a
+# single-writer-per-mkdir race this small.
+with_state_lock() { # command [args...]
+  _ensure_dirs || return 1
+  _sa_ld="$(lock_dir)"
+  _sa_waited=0
+  _sa_max_wait=5
+  while :; do
+    mkdir "$_sa_ld" 2>/dev/null && break
+    _sa_holder=$(cat "$_sa_ld/pid" 2>/dev/null)
+    if [ -n "$_sa_holder" ] && ! _pid_alive "$_sa_holder"; then
+      rm -rf "$_sa_ld" 2>/dev/null
+      continue
+    fi
+    if [ "$_sa_waited" -ge "$_sa_max_wait" ]; then
+      echo "stayawake: timed out waiting for state lock ($_sa_ld)" >&2
+      return 1
+    fi
+    sleep 1
+    _sa_waited=$((_sa_waited + 1))
+  done
+  printf '%s\n' "$$" > "$_sa_ld/pid" 2>/dev/null
+  "$@"
+  _sa_rc=$?
+  rm -rf "$_sa_ld" 2>/dev/null
+  return "$_sa_rc"
 }
 
 # Creates the baseline only if absent.

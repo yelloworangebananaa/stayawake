@@ -20,3 +20,29 @@ parse_disablesleep() {
   [ -n "$v" ] || v=0
   printf '%s' "$v"
 }
+
+# --- live system access (not unit tested; the parsers above are) ---
+
+read_state() {
+  printf 'disablesleep=%s' "$(pmset -g | parse_disablesleep)"
+}
+
+power_source() {
+  pmset -g batt | parse_batt
+}
+
+apply_state() {
+  # Requires the sudoers grant installed by `stayawake setup`. Without it this
+  # prompts and hangs, so setup is what makes lid coverage available at all.
+  sudo -n pmset -a disablesleep 1 2>/dev/null
+}
+
+restore_state() { # baseline_text
+  v=$(printf '%s' "$1" | sed -n 's/^disablesleep=\([0-9][0-9]*\)$/\1/p' | head -1)
+  [ -n "$v" ] || v=0
+  sudo -n pmset -a disablesleep "$v" 2>/dev/null
+}
+
+lid_available() {
+  sudo -n pmset -g >/dev/null 2>&1
+}

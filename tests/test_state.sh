@@ -102,4 +102,51 @@ wait
 assert_eq "$(wc -l < "${TMPDIR:-/tmp}/sa-race-$$" | tr -d ' ')" "1" "exactly one concurrent claimer wins"
 rm -f "${TMPDIR:-/tmp}/sa-race-$$"
 
+# --- with_state_lock: two concurrent holders never overlap ---
+STAYAWAKE_HOME="${TMPDIR:-/tmp}/stayawake-lock-test-$$"
+export STAYAWAKE_HOME
+rm -rf "$STAYAWAKE_HOME"
+_sa_out="$STAYAWAKE_HOME/order.log"
+mkdir -p "$STAYAWAKE_HOME"
+
+(
+  with_state_lock sh -c 'printf "BEGIN %s\n" "$1" >> "$2"; sleep 1; printf "END %s\n" "$1" >> "$2"' _ A "$_sa_out"
+) &
+_sa_p1=$!
+(
+  with_state_lock sh -c 'printf "BEGIN %s\n" "$1" >> "$2"; sleep 1; printf "END %s\n" "$1" >> "$2"' _ B "$_sa_out"
+) &
+_sa_p2=$!
+wait "$_sa_p1" "$_sa_p2"
+
+_sa_l1=$(sed -n '1p' "$_sa_out" | cut -d' ' -f1)
+_sa_l1id=$(sed -n '1p' "$_sa_out" | cut -d' ' -f2)
+_sa_l2=$(sed -n '2p' "$_sa_out" | cut -d' ' -f1)
+_sa_l2id=$(sed -n '2p' "$_sa_out" | cut -d' ' -f2)
+assert_eq "$(wc -l < "$_sa_out" | tr -d ' ')" "4" "lock: both holders logged BEGIN and END"
+assert_eq "$_sa_l1 $_sa_l1id" "BEGIN $_sa_l1id" "lock: first line is a BEGIN"
+assert_eq "$_sa_l2 $_sa_l2id" "END $_sa_l1id" "lock: second holder's BEGIN never lands before the first holder's END"
+
+# --- with_state_lock: released even when the command fails ---
+with_state_lock false
+assert_eq "$(ls "$STAYAWAKE_HOME/lock" 2>/dev/null)" "" "lock dir removed after a failing command"
+_sa_t0=$(date +%s)
+with_state_lock true
+assert_eq "$?" "0" "lock reacquirable immediately after a failed run"
+_sa_t1=$(date +%s)
+assert_eq "$([ "$((_sa_t1 - _sa_t0))" -lt 3 ] && echo fast)" "fast" "reacquire after failure did not wait out the timeout"
+
+# --- with_state_lock: a stale lock held by a dead PID is broken, not wedged ---
+mkdir -p "$STAYAWAKE_HOME/lock"
+printf '999999\n' > "$STAYAWAKE_HOME/lock/pid"
+_sa_t0=$(date +%s)
+with_state_lock true
+_sa_stale_rc=$?
+_sa_t1=$(date +%s)
+assert_eq "$_sa_stale_rc" "0" "stale lock (dead pid) is broken and the command still runs"
+assert_eq "$([ "$((_sa_t1 - _sa_t0))" -lt 3 ] && echo fast)" "fast" "stale lock was broken immediately, not waited out"
+assert_eq "$(ls "$STAYAWAKE_HOME/lock" 2>/dev/null)" "" "lock dir clean after the stale-lock run"
+
+rm -rf "$STAYAWAKE_HOME"
+
 finish
