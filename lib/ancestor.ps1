@@ -21,6 +21,8 @@ function Find-ClaudePid {
     if ($cur -le 1) { break }
     $parentNode = & $Lookup $cur
     if ($null -eq $parentNode) { break }
+    # -like is case-insensitive; shell version uses case-sensitive glob.
+    # Intentional: Windows process names are not case-consistent.
     if ($parentNode.Name -like '*claude*') { return $cur }
   }
   return $fallback

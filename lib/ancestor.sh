@@ -20,6 +20,10 @@ find_claude_pid() { # start_pid
     [ -n "$cur" ] || break
     [ "$cur" = "1" ] && break
     [ "$cur" = "0" ] && break
+    # The match depends on the OS-visible process name containing "claude".
+    # On macOS, process names may be truncated. A Node-hosted Claude install
+    # may report only "node", causing a fallback to the immediate parent.
+    # This behavior is unverified on macOS.
     case "$(_name_of "$cur")" in
       *claude*) printf '%s' "$cur"; return 0 ;;
     esac
