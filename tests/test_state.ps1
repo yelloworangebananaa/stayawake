@@ -87,6 +87,37 @@ Assert-Eq -Actual (Get-GuardCount) -Expected 0 -Name 'all guards gone'
 Clear-Baseline
 Assert-Eq -Actual (Read-Baseline) -Expected '' -Name 'baseline cleared'
 
+# --- delete is idempotent: "already gone" is success, not a crash ---
+# Two sessions' Remove-DeadGuards can enumerate the same dead-PID file and
+# both try to remove it; a session's own exit-time Unregister-Guard can race
+# a concurrent reap of the same file. Removing something already gone must
+# be a silent no-op, not a thrown ItemNotFoundException -- otherwise a normal
+# race becomes a crash (worst inside Remove-DeadGuards' foreach, where it
+# would abort the batch and strand every remaining dead guard un-reaped).
+Register-Guard -SessionId 'sess-idem' -Kind 'turn' -GuardPid $PID -ParentPid $PID
+Unregister-Guard -SessionId 'sess-idem' -Kind 'turn'
+$threw = $false
+try { Unregister-Guard -SessionId 'sess-idem' -Kind 'turn' } catch { $threw = $true }
+Assert-Eq -Actual $threw -Expected $false -Name 'Unregister-Guard on an already-removed guard does not throw'
+Assert-Eq -Actual (Get-GuardCount) -Expected 0 -Name 'double-unregister leaves refcount at 0'
+
+Claim-Baseline -Text 'lidAc=idem' | Out-Null
+Clear-Baseline
+$threw = $false
+try { Clear-Baseline } catch { $threw = $true }
+Assert-Eq -Actual $threw -Expected $false -Name 'Clear-Baseline on an already-cleared baseline does not throw'
+
+# The regression that actually matters: Remove-DeadGuards must finish
+# reaping every dead guard in the batch even when one entry was already
+# removed by someone else before the reap ran -- a loop that aborts partway
+# leaves the refcount stuck and nothing left to trigger the restore.
+Register-Guard -SessionId 'sess-dead-x' -Kind 'turn' -GuardPid 999998 -ParentPid 999998
+Register-Guard -SessionId 'sess-dead-y' -Kind 'turn' -GuardPid 999999 -ParentPid 999999
+Remove-Item (Get-GuardFile -SessionId 'sess-dead-x' -Kind 'turn') -Force
+Assert-Eq -Actual (Get-GuardCount) -Expected 1 -Name 'one dead guard removed out from under the reaper before it runs'
+Remove-DeadGuards
+Assert-Eq -Actual (Get-GuardCount) -Expected 0 -Name 'Remove-DeadGuards still reaps the remaining dead guard rather than aborting'
+
 Remove-Item $env:STAYAWAKE_HOME -Recurse -Force
 
 # --- STAYAWAKE_HOME under an 8.3 short-name path, exercised end to end ---

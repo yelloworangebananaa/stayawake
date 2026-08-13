@@ -76,7 +76,16 @@ function Read-Baseline {
 function Clear-Baseline {
   $f = Get-BaselineFile
   if (Test-Path $f) {
-    Remove-Item (Get-Item $f).FullName -Force -ErrorAction Stop
+    # Get-Item is inside the try too: if the file vanishes between Test-Path
+    # and here (a concurrent Clear-Baseline), Get-Item throws the same
+    # ItemNotFoundException that Remove-Item would. Delete is idempotent --
+    # "already gone" is the desired end state, not a failure -- so only that
+    # one exception type is swallowed. Any other failure (permissions, disk)
+    # still throws loud, same as everywhere else in this file.
+    try {
+      Remove-Item (Get-Item $f).FullName -Force -ErrorAction Stop
+    } catch [System.Management.Automation.ItemNotFoundException] {
+    }
   }
 }
 
@@ -117,7 +126,14 @@ function Unregister-Guard {
   param([string]$SessionId, [string]$Kind)
   $f = Get-GuardFile -SessionId $SessionId -Kind $Kind
   if (Test-Path $f) {
-    Remove-Item (Get-Item $f).FullName -Force -ErrorAction Stop
+    # Same idempotent-delete reasoning as Clear-Baseline: a concurrent
+    # Remove-DeadGuards could reap this exact file between Test-Path and
+    # here. Get-Item is inside the try for the same reason -- it can throw
+    # ItemNotFoundException too if the file is already gone by then.
+    try {
+      Remove-Item (Get-Item $f).FullName -Force -ErrorAction Stop
+    } catch [System.Management.Automation.ItemNotFoundException] {
+    }
   }
 }
 
@@ -165,7 +181,17 @@ function Remove-DeadGuards {
     $m = [regex]::Match($raw, '(?m)^guard_pid=(\d+)\r?$')
     if (-not $m.Success) { continue }
     if (-not (Test-PidAlive -ProcessId ([int]$m.Groups[1].Value))) {
-      Remove-Item $f.FullName -Force -ErrorAction Stop
+      # Two sessions' Remove-DeadGuards can both enumerate the same dead-PID
+      # file and both try to remove it; this session's own exit-time
+      # Unregister-Guard can race a concurrent reap of the same file. Delete
+      # is idempotent -- swallow only "already gone" so this one entry
+      # doesn't abort the foreach and strand every other dead guard in the
+      # batch un-reaped. $f is already a FileInfo from Get-ChildItem, so no
+      # second Get-Item lookup is needed here.
+      try {
+        Remove-Item $f.FullName -Force -ErrorAction Stop
+      } catch [System.Management.Automation.ItemNotFoundException] {
+      }
     }
   }
 }
