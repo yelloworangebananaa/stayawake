@@ -1,0 +1,11 @@
+{
+  "name": "stayawake",
+  "owner": { "name": "yelloworangebananaa" },
+  "plugins": [
+    {
+      "name": "stayawake",
+      "source": "./",
+      "description": "Keeps your machine awake while Claude Code is working — lid closed or idle."
+    }
+  ]
+}
