@@ -84,8 +84,15 @@ on both platforms. Watchdog duty is therefore free rather than an extra componen
 | Path | Purpose |
 |---|---|
 | `original.json` | Power settings as they were before any guard ran. |
-| `guards/<pid>` | One file per live guard. Serves as the refcount. |
+| `guards/<session_id>-turn` | Guard for the current turn of that session. |
+| `guards/<session_id>-pin` | Guard pinned by `/stayawake on` for that session. |
 | `config.json` | `batteryFloor` (default 30), `enabled` (default true). |
+
+Guard files are keyed by session id, not by guard PID, because the `Stop` hook knows its
+own `session_id` (from the hook payload) but not the PID of the guard it needs to signal.
+Each file contains the guard's PID and the watched parent PID. The `-turn` / `-pin`
+suffixes let a pinned guard and a turn guard coexist in one session without collision;
+they also serve as the refcount, since two files means two live guards.
 
 `original.json` is written by the first guard using an atomic create-if-not-exists
 (`O_EXCL` / `New-Item` without `-Force`). Concurrent Claude Code sessions therefore
@@ -98,16 +105,20 @@ cleaned by whichever guard still runs, or by the login backstop if none do.
 
 ### Guard lifecycle
 
-1. Read current power settings.
-2. Atomically create `original.json` if absent; create own `guards/<pid>` file.
-3. Apply: idle-sleep block (unprivileged) and lid-close override (via the grant).
-4. Poll loop, every 30 seconds:
+1. Read current power settings and battery status.
+2. If on battery and below `batteryFloor`, exit immediately without applying anything.
+   This check precedes `apply` so that a new turn started under a low battery does not
+   engage the override and then release it seconds later on the first poll.
+3. Atomically create `original.json` if absent; create own `guards/<session_id>-<kind>`
+   file.
+4. Apply: idle-sleep block (unprivileged) and lid-close override (via the grant).
+5. Poll loop, every 30 seconds:
    - Is the parent PID alive? If not, exit to restore.
-   - Does own pidfile still exist? If not (Stop hook removed it), exit to restore.
+   - Does own guard file still exist? If not (the `Stop` hook deleted it), exit to restore.
    - On battery below `batteryFloor`? If so, exit to restore.
-   - Reap dead siblings' pidfiles.
-5. On exit by any path: remove own pidfile; if last guard, restore from `original.json`
-   and delete it.
+   - Reap guard files whose recorded PID is no longer alive.
+6. On exit by any path: remove own guard file; if `guards/` is now empty, restore from
+   `original.json` and delete it.
 
 ## Platform implementation
 
@@ -168,7 +179,7 @@ claiming coverage the plugin cannot deliver.
 | Command | Effect |
 |---|---|
 | `/stayawake setup` | One-time privileged install of the grant and login backstop. |
-| `/stayawake uninstall` | Removes grant, login task, and state directory. |
+| `/stayawake uninstall` | Restores from `original.json` if stale, then removes grant, login task, and state directory. Runs the restore first, so uninstalling while a guard is live cannot strand modified settings. |
 | `/stayawake status` | Reports grant presence, active guards, battery, S0ix warning. |
 | `/stayawake on` | Pins protection for the session, independent of turn boundaries. |
 | `/stayawake off` | Releases a pinned guard. |
