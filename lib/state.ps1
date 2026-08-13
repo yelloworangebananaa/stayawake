@@ -19,7 +19,14 @@ function Get-GuardFile {
 function Get-BaselineFile { return (Join-Path (Get-StateDir) 'original.state') }
 
 function Initialize-StateDirs {
+  # New-Item -Force silently no-ops when the target path already exists as a
+  # non-directory item -- it does NOT throw, so -ErrorAction Stop alone never
+  # catches "guards" existing as a regular file. Verify the result is actually
+  # a directory and throw ourselves; the caller's catch turns that into a 2.
   New-Item -ItemType Directory -Force -Path (Get-GuardsDir) -ErrorAction Stop | Out-Null
+  if (-not (Test-Path -Path (Get-GuardsDir) -PathType Container)) {
+    throw "guards path exists and is not a directory: $(Get-GuardsDir)"
+  }
 }
 
 # CreateNew throws IOException when the file exists. That throw is the atomic
@@ -43,7 +50,12 @@ function Claim-Baseline {
   try {
     $fs = [System.IO.File]::Open((Get-BaselineFile), [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
   } catch [System.IO.IOException] {
-    if (Test-Path (Get-BaselineFile)) { return 1 }
+    # Length -gt 0 (exists and non-empty) rather than a bare Test-Path: an
+    # existing-but-empty baseline is a partial write (create succeeded, data
+    # write didn't) and must be treated as a failed claim, not a valid one to
+    # proceed from. Mirrors sh's `[ -s ... ]` in claim_baseline().
+    $existing = Get-Item (Get-BaselineFile) -ErrorAction SilentlyContinue
+    if ($existing -and $existing.Length -gt 0) { return 1 }
     return 2
   } catch {
     return 2

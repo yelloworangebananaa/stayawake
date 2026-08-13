@@ -36,6 +36,37 @@ Assert-Eq -Actual (Claim-Baseline -Text 'x') -Expected 2 -Name 'write failure (u
 Remove-Item $blocker -Force
 $env:STAYAWAKE_HOME = $savedHome
 
+# --- guards directory unusable: Initialize-StateDirs must fail, claim must not proceed ---
+# "guards" exists as a regular file. New-Item -ItemType Directory -Force silently
+# no-ops when the target already exists as a non-directory item -- it does NOT
+# throw -- so -ErrorAction Stop alone never catches this. Before the fix,
+# Claim-Baseline went on to write the baseline anyway and returned 0, telling the
+# caller it was safe to mutate power settings even though no guard could ever be
+# registered to release them later.
+$guardsHome = Join-Path $tempDir "sa-guardsfile-$PID"
+if (Test-Path $guardsHome) { Remove-Item $guardsHome -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $guardsHome | Out-Null
+Set-Content -Path (Join-Path $guardsHome 'guards') -Value 'x' -Encoding utf8
+$savedHome3 = $env:STAYAWAKE_HOME
+$env:STAYAWAKE_HOME = $guardsHome
+Assert-Eq -Actual (Claim-Baseline -Text 'x') -Expected 2 -Name 'guards dir unusable (regular file) returns 2, not 0'
+$env:STAYAWAKE_HOME = $savedHome3
+Remove-Item $guardsHome -Recurse -Force
+
+# --- empty baseline is a partial write, not a valid claim to proceed from ---
+# A zero-byte original.state means the create succeeded but the data write
+# didn't. Before the fix, a bare Test-Path treated this as "already exists" and
+# returned 1 (safe to proceed) -- but proceeding means restoring from nothing.
+$emptyHome = Join-Path $tempDir "sa-emptybaseline-$PID"
+if (Test-Path $emptyHome) { Remove-Item $emptyHome -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $emptyHome | Out-Null
+New-Item -ItemType File -Force -Path (Join-Path $emptyHome 'original.state') | Out-Null
+$savedHome4 = $env:STAYAWAKE_HOME
+$env:STAYAWAKE_HOME = $emptyHome
+Assert-Eq -Actual (Claim-Baseline -Text 'x') -Expected 2 -Name 'empty baseline file returns 2, not 1'
+$env:STAYAWAKE_HOME = $savedHome4
+Remove-Item $emptyHome -Recurse -Force
+
 # --- refcount ---
 Assert-Eq -Actual (Get-GuardCount) -Expected 0 -Name 'no guards at start'
 Register-Guard -SessionId 'sess-a' -Kind 'turn' -GuardPid $PID -ParentPid $PID
