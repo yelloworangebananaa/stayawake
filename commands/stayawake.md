@@ -16,7 +16,8 @@ If the verb is `setup`, warn the user first that it will request administrator
 or sudo approval once, and say exactly what it grants:
 
 - macOS: a sudoers rule permitting only `pmset -a disablesleep 0` and `pmset -a disablesleep 1`.
-- Windows: two scheduled tasks that toggle the lid-close power setting.
+- Windows: three scheduled tasks — two that toggle the lid-close power setting,
+  and one that runs at logon to restore it if a crash left it applied.
 
 If the verb is `on` or `off`, pass the current session id as the second argument
 so the pin is scoped to this session.
