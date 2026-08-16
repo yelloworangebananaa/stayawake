@@ -39,7 +39,17 @@ Assert-Eq -Actual (Test-Path (Get-LockDir)) -Expected $false -Name 'lock dir rem
 # UnauthorizedAccessException, the same failure shape as the collision that
 # caused the original hang).
 Remove-Item $env:STAYAWAKE_HOME -Recurse -Force -ErrorAction SilentlyContinue
+# The guards dir MUST be pre-created. Invoke-WithStateLock's first statement is
+# `try { Initialize-StateDirs } catch { return $null }`, and Initialize-StateDirs
+# creates guards/. Without it existing already, the deny ACL below makes that
+# first line throw and the function returns BEFORE the while loop is ever
+# entered -- so the stale-break branch this test exists to cover never runs, and
+# the test passes identically with or without the fix. (Measured: ~21ms when
+# guards is missing, ~4.2s when it pre-exists and the loop actually iterates.)
+# With guards already present, Initialize-StateDirs' New-Item -Force is a no-op
+# and the ACL only blocks what it should: the break target inside the loop.
 New-Item -ItemType Directory -Force -Path (Get-LockDir) | Out-Null
+New-Item -ItemType Directory -Force -Path (Get-GuardsDir) | Out-Null
 Set-Content -Path (Join-Path (Get-LockDir) 'pid') -Value '999999' -Encoding utf8
 $stateDirLong = (Get-Item (Get-StateDir)).FullName
 $aclUser = "$env:USERDOMAIN\$env:USERNAME"
@@ -50,11 +60,18 @@ try {
   $sw.Stop()
   Assert-Eq -Actual ($null -eq $spinResult) -Expected $true `
             -Name 'no-spin: a permanently-blocked stale-break still returns (action never runs)'
-  # Generous upper bound -- this proves "bounded", not "instant". Under the
-  # pre-fix code (unconditional `continue` around the wait/sleep gate) this
-  # line is never reached at all; the process spins pinning a core forever.
+  # Generous upper bound -- this proves "bounded", not "instant". The lower
+  # bound below is what makes it discriminate: the loop must actually have
+  # slept through its budget. A run that returns near-instantly means
+  # Invoke-WithStateLock bailed before the loop (see the guards-dir note
+  # above), which is how this test was silently vacuous before.
   Assert-Eq -Actual ($sw.Elapsed.TotalSeconds -lt 15) -Expected $true `
             -Name 'no-spin: a permanently-blocked stale-break returns within a bounded time, not forever'
+  # Lower bound: with MaxWaitSeconds 2 the loop must have entered and slept
+  # through its budget. If this fails, Invoke-WithStateLock returned before
+  # the loop and the two assertions above proved nothing.
+  Assert-Eq -Actual ($sw.Elapsed.TotalSeconds -ge 1.5) -Expected $true `
+            -Name 'no-spin: the loop was actually entered (elapsed >= the wait budget, not an early bail)'
 } finally {
   icacls $stateDirLong /remove:d "$aclUser" | Out-Null
 }
