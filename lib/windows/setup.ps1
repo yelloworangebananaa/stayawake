@@ -10,6 +10,27 @@ function Test-Elevated {
   return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# Single source of truth for every scheduled task Invoke-SaSetup registers.
+# Invoke-SaUninstall iterates $script:SaAllTaskNames (built from the other
+# two) rather than its own hardcoded list, so the two can never drift apart
+# -- a hardcoded pair in one function and a hardcoded triple in the other is
+# exactly how an uninstall silently starts leaving debris behind.
+$script:SaElevatedTaskNames = @('Disable', 'Restore') # RunLevel Highest, run lib/windows/lid.ps1
+$script:SaBootTaskName      = 'BootRestore'            # unprivileged, AtLogOn -> restore-if-stale boot
+$script:SaAllTaskNames      = $script:SaElevatedTaskNames + @($script:SaBootTaskName)
+
+# Pure string-builder for the BootRestore task's Action argument, pulled out
+# of Invoke-SaSetup so it's testable without touching Register-ScheduledTask
+# or powercfg. Must resolve to BOOT mode specifically, not normal mode:
+# normal mode consults guard liveness (Test-PidAlive), and a recycled PID
+# making a dead guard look alive is exactly what would block the restore --
+# Windows recycles PIDs faster than POSIX, so this is the likelier failure
+# here, not a rarer one.
+function Get-SaBootRestoreArgument {
+  param([string]$StayawakeScript)
+  return "-NoProfile -ExecutionPolicy Bypass -File `"$StayawakeScript`" -Verb restore-if-stale -SessionId boot"
+}
+
 function Invoke-SaSetup {
   param([string]$Root)
 
@@ -42,34 +63,39 @@ function Invoke-SaSetup {
     Write-Host '           Lid close is partly firmware-controlled and may sleep anyway.'
   }
 
-  $lidScript = Join-Path $Root 'lib\windows\lid.ps1'
+  $lidScript       = Join-Path $Root 'lib\windows\lid.ps1'
+  $stayawakeScript = Join-Path $Root 'bin\stayawake.ps1'
 
   # Correction 2: New-ScheduledTaskSettingsSet defaults refuse to START a
   # task on battery AND stop a RUNNING task the instant the machine
   # switches to battery. Left at defaults that silently disables lid
   # coverage in exactly the scenario stayawake exists for -- a laptop
   # running on battery with the lid shut. Do not "clean up" these three
-  # lines; they are load-bearing, not boilerplate.
+  # lines; they are load-bearing, not boilerplate. Every task below shares
+  # $settings, including BootRestore: a logon restore that refuses to run
+  # because the laptop happens to be on battery is useless exactly when it
+  # matters most.
   $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
                                            -DontStopIfGoingOnBatteries `
                                            -ExecutionTimeLimit ([TimeSpan]::Zero)
-  $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest -LogonType Interactive
+  $elevatedPrincipal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest -LogonType Interactive
 
-  # Only "Restore" gets a trigger (AtLogOn -- the crash/reboot backstop:
-  # lid.ps1's own Restore branch already defaults safely to Sleep(1,1) when
-  # restore.state is absent or unparseable, see that file's header comment).
+  # Only "Restore" gets a trigger (AtLogOn), and it stays pointed at
+  # lib/windows/lid.ps1 -- Invoke-RestoreState in lib/windows/platform.ps1
+  # (not modified here) always writes restore.state and then does
+  # `schtasks /run /tn "StayAwake\Restore"` expecting that exact Action;
+  # repointing it would break the guard's normal synchronous restore path.
   # "Disable" is on-demand only, run exclusively via `schtasks /run` from
-  # Invoke-ApplyState in lib/windows/platform.ps1 -- passing an empty
-  # -Trigger array to Register-ScheduledTask for it is not equivalent to
-  # omitting the parameter, so the parameter is omitted entirely rather than
-  # passed as @().
-  foreach ($action in @('Disable','Restore')) {
+  # Invoke-ApplyState -- passing an empty -Trigger array to
+  # Register-ScheduledTask for it is not equivalent to omitting the
+  # parameter, so the parameter is omitted entirely rather than passed as @().
+  foreach ($action in $script:SaElevatedTaskNames) {
     $a = New-ScheduledTaskAction -Execute 'powershell.exe' `
          -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$lidScript`" -Action $action"
     $registerArgs = @{
       TaskName  = "StayAwake\$action"
       Action    = $a
-      Principal = $principal
+      Principal = $elevatedPrincipal
       Settings  = $settings
       Force     = $true
     }
@@ -79,6 +105,24 @@ function Invoke-SaSetup {
     Register-ScheduledTask @registerArgs | Out-Null
   }
 
+  # BootRestore: the actual crash/reboot backstop. A hard reboot or power
+  # loss while a guard is registered leaves original.state present and the
+  # lid override still applied on disk -- no in-process cleanup ran and no
+  # sibling guard is left to reap it. This task is the only thing that runs
+  # after that. -RunLevel Limited (unprivileged) on purpose: it only needs
+  # to reach Invoke-SaRestoreIfStale -Mode boot, which itself only needs to
+  # TRIGGER the elevated Restore work already covered above -- Invoke-RestoreState
+  # writes restore.state and runs the "Restore" task; this task must not
+  # duplicate that logic, just get boot mode's guard-wipe-then-maybe-restore
+  # decision made on every logon. See Get-SaBootRestoreArgument for why the
+  # argument string must say "-SessionId boot", not just "restore-if-stale".
+  $bootPrincipal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Limited -LogonType Interactive
+  $bootAction = New-ScheduledTaskAction -Execute 'powershell.exe' `
+       -Argument (Get-SaBootRestoreArgument -StayawakeScript $stayawakeScript)
+  Register-ScheduledTask -TaskName "StayAwake\$script:SaBootTaskName" -Action $bootAction `
+                         -Principal $bootPrincipal -Settings $settings `
+                         -Trigger @(New-ScheduledTaskTrigger -AtLogOn) -Force | Out-Null
+
   Write-Host 'stayawake: setup complete.'
 }
 
@@ -86,7 +130,10 @@ function Invoke-SaUninstall {
   # Restore first, with the force mode. Uninstalling while a guard is live
   # must never strand the user's lid setting once the grant is gone.
   Invoke-SaRestoreIfStale -Mode 'force'
-  foreach ($t in @('Disable','Restore')) {
+  # Iterates $script:SaAllTaskNames (Disable, Restore, BootRestore) -- see
+  # that variable's definition above. An uninstall that leaves the logon
+  # task behind is worse than not having one.
+  foreach ($t in $script:SaAllTaskNames) {
     Unregister-ScheduledTask -TaskName "StayAwake\$t" -Confirm:$false -ErrorAction SilentlyContinue
   }
   $d = Get-StateDir

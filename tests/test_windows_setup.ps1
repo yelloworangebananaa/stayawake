@@ -90,6 +90,63 @@ Invoke-SaRestoreIfStale -Mode 'boot'
 Assert-Eq -Actual (Get-RestoreLog) -Expected '' -Name 'boot, no baseline: restore never called'
 Assert-Eq -Actual (Get-GuardCount) -Expected 0 -Name 'boot, no baseline: guards directory still wiped'
 
+# --- single source of truth: the task list Invoke-SaUninstall iterates is
+# built from the same names Invoke-SaSetup registers (see the
+# $script:SaElevatedTaskNames / $script:SaBootTaskName / $script:SaAllTaskNames
+# definitions in lib/windows/setup.ps1). Pin the exact set and order so a
+# future edit that adds a task to one but not the other fails loudly here.
+Assert-Eq -Actual ($script:SaAllTaskNames -join ',') -Expected 'Disable,Restore,BootRestore' `
+          -Name 'task list: Disable, Restore, BootRestore, derived from one source'
+
+# --- BootRestore's action must resolve to BOOT mode, not normal mode ---
+# Normal mode consults guard liveness (Test-PidAlive); a recycled PID making
+# a dead guard look alive is exactly what would block the restore, and
+# Windows recycles PIDs faster than POSIX. Get-SaBootRestoreArgument is a
+# pure string builder pulled out of Invoke-SaSetup for exactly this reason:
+# it's checkable without touching Register-ScheduledTask or powercfg.
+$bootArg = Get-SaBootRestoreArgument -StayawakeScript 'C:\fake\bin\stayawake.ps1'
+Assert-Eq -Actual ($bootArg -match '-Verb restore-if-stale') -Expected $true `
+          -Name 'BootRestore action invokes the restore-if-stale verb'
+Assert-Eq -Actual ($bootArg -match '-SessionId boot\b') -Expected $true `
+          -Name 'BootRestore action selects boot mode via -SessionId boot, not normal mode'
+
+# --- Invoke-SaUninstall removes every task Invoke-SaSetup registers ---
+# Stub Unregister-ScheduledTask (a real cmdlet) with a same-named function --
+# PowerShell resolves an unqualified command to a function ahead of a cmdlet
+# of the same name, so this shadows the real one for the duration of
+# Invoke-SaUninstall without touching Task Scheduler at all. The log lives
+# outside STAYAWAKE_HOME because Invoke-SaUninstall recursively deletes the
+# state dir as its last step -- a log inside it would vanish with it.
+$uninstallOutDir = Join-Path $tempDir "stayawake-uninstalltest-$PID"
+if (Test-Path $uninstallOutDir) { Remove-Item $uninstallOutDir -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $uninstallOutDir | Out-Null
+$unregisterLog = Join-Path $uninstallOutDir 'unregister.log'
+$uninstallRestoreLog = Join-Path $uninstallOutDir 'restore.log'
+
+function Unregister-ScheduledTask {
+  param([string]$TaskName, [switch]$Confirm, $ErrorAction)
+  Add-Content -Path $unregisterLog -Value $TaskName
+}
+# Redefines the Invoke-RestoreState stub to log outside STAYAWAKE_HOME for
+# the same reason as $unregisterLog above; nothing later in this file needs
+# the original definition.
+function Invoke-RestoreState {
+  param([string]$Baseline)
+  Add-Content -Path $uninstallRestoreLog -Value "restore:$Baseline"
+}
+
+Claim-Baseline -Text 'lidAc=1;lidDc=1' | Out-Null
+Invoke-SaUninstall | Out-Null
+
+$unregistered = @(Get-Content $unregisterLog) | Sort-Object
+$expectedTasks = @($script:SaAllTaskNames | ForEach-Object { "StayAwake\$_" }) | Sort-Object
+Assert-Eq -Actual ($unregistered -join ',') -Expected ($expectedTasks -join ',') `
+          -Name 'uninstall unregisters exactly the tasks setup registers (Disable, Restore, BootRestore)'
+Assert-Eq -Actual ((Get-Content $uninstallRestoreLog -Raw).Trim()) -Expected 'restore:lidAc=1;lidDc=1' `
+          -Name 'uninstall restores (force mode) before removing tasks'
+Assert-Eq -Actual (Test-Path $env:STAYAWAKE_HOME) -Expected $false -Name 'uninstall removes the state directory'
+
+Remove-Item $uninstallOutDir -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item $env:STAYAWAKE_HOME -Recurse -Force -ErrorAction SilentlyContinue
 
 # --- verb dispatch through bin/stayawake.ps1, run as real subprocesses so the
