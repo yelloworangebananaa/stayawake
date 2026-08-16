@@ -5,7 +5,7 @@
     {
       "name": "stayawake",
       "source": "./",
-      "description": "Keeps your machine awake while Claude Code is working — lid closed or idle."
+      "description": "Keeps your machine awake while Claude Code is working — lid closed or idle. Restores every setting afterwards."
     }
   ]
 }
