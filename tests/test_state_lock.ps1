@@ -44,8 +44,12 @@ Remove-Item $env:STAYAWAKE_HOME -Recurse -Force -ErrorAction SilentlyContinue
 # creates guards/. Without it existing already, the deny ACL below makes that
 # first line throw and the function returns BEFORE the while loop is ever
 # entered -- so the stale-break branch this test exists to cover never runs, and
-# the test passes identically with or without the fix. (Measured: ~21ms when
-# guards is missing, ~4.2s when it pre-exists and the loop actually iterates.)
+# the test passes identically with or without the fix. The two cases are far
+# apart and easy to tell apart by eye: missing guards returns in single-digit
+# milliseconds, pre-created guards takes the full MaxWaitSeconds budget because
+# the loop actually iterates. The >= assertion below is what enforces it; no
+# specific timing is quoted here, because a hardcoded number in a comment is
+# the same kind of claim-without-a-check this test was fixed to eliminate.
 # With guards already present, Initialize-StateDirs' New-Item -Force is a no-op
 # and the ACL only blocks what it should: the break target inside the loop.
 New-Item -ItemType Directory -Force -Path (Get-LockDir) | Out-Null
