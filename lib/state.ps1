@@ -152,12 +152,14 @@ function Unregister-Guard {
 function Get-GuardCount {
   $d = Get-GuardsDir
   if (-not (Test-Path $d)) { return 0 }
-  # Correction 2: exclude '.stale.*' the same way '.tmp-*' is excluded above.
-  # The lock's break target (Invoke-WithStateLock, below) normally lives next
-  # to "guards", not inside it, but Windows has no dotfile convention -- a
-  # ".stale.*" entry anywhere Get-ChildItem -File can see it would otherwise
-  # be miscounted as a live guard and reintroduce the refcount bug.
-  return @(Get-ChildItem -Path $d -File | Where-Object { $_.Name -notlike '.tmp-*' -and $_.Name -notlike '.stale.*' }).Count
+  # Correction 2: exclude the lock's stale-break target the same way
+  # '.tmp-*' is excluded above. The actual name Invoke-WithStateLock
+  # generates is "lock.stale.<pid>.<guid>" (no leading dot -- Windows has no
+  # dotfile convention, so there is no reason to fake one here), and it
+  # normally lives next to "guards", not inside it -- but a "*.stale.*"
+  # entry anywhere Get-ChildItem -File can see it would otherwise be
+  # miscounted as a live guard and reintroduce the refcount bug.
+  return @(Get-ChildItem -Path $d -File | Where-Object { $_.Name -notlike '.tmp-*' -and $_.Name -notlike '*.stale.*' }).Count
 }
 
 function Test-PidAlive {
@@ -183,7 +185,7 @@ function Test-PidAlive {
 function Remove-DeadGuards {
   $d = Get-GuardsDir
   if (-not (Test-Path $d)) { return }
-  foreach ($f in Get-ChildItem -Path $d -File | Where-Object { $_.Name -notlike '.tmp-*' -and $_.Name -notlike '.stale.*' }) {
+  foreach ($f in Get-ChildItem -Path $d -File | Where-Object { $_.Name -notlike '.tmp-*' -and $_.Name -notlike '*.stale.*' }) {
     # A zero-byte (or otherwise unreadable) file is the canonical unparseable
     # guard file. Get-Content -Raw returns $null for an empty file, and
     # [regex]::Match($null, ...) throws MethodInvocationException rather than
@@ -230,16 +232,29 @@ function Get-LockDir { return (Join-Path (Get-StateDir) 'lock') }
 # while holding the lock must not wedge every future session forever (that
 # is the expected case here, not the exotic one). If the lock is held and
 # its recorded pid is not alive, break it by renaming the lock dir to a
-# private per-process name ([System.IO.Directory]::Move), then deleting the
+# private per-*attempt* name ([System.IO.Directory]::Move), then deleting the
 # renamed copy. Only one racer's rename can succeed -- the source vanishes
 # for everyone else the instant it wins -- which was verified experimentally
 # against NTFS before this was relied on (see task-9-report.md). A failed
-# rename means someone else already broke this lock instance first: fall
-# through and retry, and never fall back to deleting by the shared path --
-# that is exactly the two-winner bug the sh twin's history warns against
-# (two waiters both judging the same dead pid stale and both rm -rf'ing the
-# same path, the second hitting a lock a third process legitimately
-# recreated there).
+# rename means someone else already broke this lock instance first (or this
+# attempt's own cleanup collided): fall through to the SAME bounded wait
+# every other non-acquiring path uses, and never fall back to deleting by
+# the shared path -- that is exactly the two-winner bug the sh twin's
+# history warns against.
+#
+# The break target is suffixed with a fresh guid, not just this process's
+# pid: a name that is only unique per-*process* still collides with a
+# leftover from an EARLIER attempt by this same pid whose own cleanup
+# Remove-Item silently failed (Directory.Move throws -- and leaves the
+# source, i.e. the still-held lock, untouched -- when the destination
+# already exists). That collision reproduced live on this machine
+# ("Cannot create a file when that file already exists"), and combined with
+# the branch not being subject to the bounded wait, it hung this loop
+# forever with no timeout and no sleep -- a pinned core and, downstream in
+# guard cleanup, "restore never fires". Round 1 fix: unique-per-attempt
+# target AND every iteration of this loop that doesn't acquire, including
+# this branch, must pass through the same $waited/$MaxWaitSeconds gate
+# below. No path may `continue` around it.
 #
 # Ownership is verified both right after acquiring (in case our own
 # just-created lock was broken as stale before we finished stamping our pid
@@ -288,7 +303,9 @@ function Invoke-WithStateLock {
     $holderPid = 0
     $holderParsed = $holder -and [int]::TryParse($holder, [ref]$holderPid)
     if ($holderParsed -and -not (Test-PidAlive -ProcessId $holderPid)) {
-      $staleTarget = "$lockDir.stale.$PID"
+      # guid suffix: see the header comment above for why per-process alone
+      # is not enough.
+      $staleTarget = "$lockDir.stale.$PID.$([guid]::NewGuid().ToString('N'))"
       $renamed = $false
       try {
         [System.IO.Directory]::Move($lockDir, $staleTarget)
@@ -297,9 +314,19 @@ function Invoke-WithStateLock {
         $renamed = $false
       }
       if ($renamed) {
-        Remove-Item -Path $staleTarget -Recurse -Force -ErrorAction SilentlyContinue
+        # Best-effort: a leftover here is inert clutter, never a correctness
+        # hazard -- the guid suffix means it can never collide with a future
+        # attempt's target. Get-Item resolves a short (8.3) $staleTarget the
+        # way plain Remove-Item cannot (see the file-header short-path note).
+        try {
+          Remove-Item -Path (Get-Item $staleTarget).FullName -Recurse -Force -ErrorAction Stop
+        } catch {
+        }
       }
-      continue
+      # Do NOT `continue` here regardless of outcome. Every iteration that
+      # isn't an acquire -- including this one -- falls through to the same
+      # bounded wait below; that is what makes the timeout actually bound
+      # the loop instead of being one of several possible exits.
     }
 
     if ($waited -ge $MaxWaitSeconds) {
@@ -316,7 +343,18 @@ function Invoke-WithStateLock {
     $holder = $null
     try { $holder = (Get-Content -Path $pidFile -Raw -ErrorAction SilentlyContinue).Trim() } catch {}
     if ($holder -eq "$PID") {
-      Remove-Item -Path $lockDir -Recurse -Force -ErrorAction SilentlyContinue
+      # Get-Item resolves a short (8.3) $lockDir the way plain Remove-Item
+      # cannot (see the file-header short-path note). Unlike the stale-
+      # cleanup above, a release failure here is NOT harmless clutter -- it
+      # leaves a lock directory behind whose pid is this very process,
+      # alive, and therefore never judged stale by a future waiter: every
+      # future session would wait out its own timeout and hit FATAL. Fail
+      # loud rather than swallowing it.
+      try {
+        Remove-Item -Path (Get-Item $lockDir).FullName -Recurse -Force -ErrorAction Stop
+      } catch {
+        [Console]::Error.WriteLine("stayawake: FATAL could not release state lock ($lockDir): $($_.Exception.Message)")
+      }
     }
   }
 }

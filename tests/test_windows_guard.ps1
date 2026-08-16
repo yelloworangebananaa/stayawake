@@ -33,8 +33,15 @@ $guard = Join-Path $here '..\bin\guard.ps1'
 $guardQ = '"' + $guard + '"'
 
 # --- low battery: no apply, no registration ---
+# Positive control: assert the child actually launched and ran its
+# early-exit path (exit 0) rather than merely asserting the absence of
+# apply/registration side effects -- a child that fails to launch at all
+# (e.g. the same path-quoting trap $guardQ exists for, below) would satisfy
+# those absence checks just as well as a correctly-declining guard, and the
+# test would pass for the wrong reason.
 $env:STAYAWAKE_STUB_POWER = 'battery 12'
 & powershell -NoProfile -ExecutionPolicy Bypass -File $guard -SessionId 'sess-low' -Kind 'turn' -ParentPid $PID
+Assert-Eq -Actual $LASTEXITCODE -Expected 0 -Name 'low battery guard process actually ran and exited cleanly'
 $log = ''
 if (Test-Path $env:STAYAWAKE_STUB_LOG) { $log = (Get-Content $env:STAYAWAKE_STUB_LOG -Raw) }
 Assert-Eq -Actual $log -Expected '' -Name 'low battery guard never applies'
