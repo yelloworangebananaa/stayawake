@@ -56,3 +56,40 @@ function Test-ModernStandbyFromText {
   $hasS3 = $block -match 'Standby \(S3\)'
   return ($hasS0 -and -not $hasS3)
 }
+
+# --- live system access (not unit tested; the parsers above are) ---
+
+$script:SubButtons = '4f971e89-eebd-4455-a8de-9e59040e7347'
+$script:LidAction  = '5ca83367-6e45-459f-a27b-476b1d01c936'
+
+function Get-LidActionLive {
+  $text = (powercfg /query SCHEME_CURRENT $script:SubButtons $script:LidAction 2>&1 | Out-String)
+  return Get-LidActionFromText -Text $text
+}
+
+function Get-CurrentState {
+  $lid = Get-LidActionLive
+  if (-not $lid.Present) { return 'lidAc=-1;lidDc=-1' }
+  return "lidAc=$($lid.Ac);lidDc=$($lid.Dc)"
+}
+
+function Get-PowerSource {
+  $b = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($null -eq $b) {
+    return Get-PowerSourceFromStatus -BatteryStatus 0 -ChargePercent 0 -HasBattery $false
+  }
+  return Get-PowerSourceFromStatus -BatteryStatus ([int]$b.BatteryStatus) `
+                                   -ChargePercent ([int]$b.EstimatedChargeRemaining) `
+                                   -HasBattery $true
+}
+
+# The guard is unprivileged; the elevated scheduled tasks do the actual writes.
+function Invoke-ApplyState {
+  schtasks /run /tn "StayAwake\Disable" | Out-Null
+}
+
+function Invoke-RestoreState {
+  param([string]$Baseline)
+  Set-Content -Path (Join-Path (Get-StateDir) 'restore.state') -Value $Baseline -Encoding utf8
+  schtasks /run /tn "StayAwake\Restore" | Out-Null
+}

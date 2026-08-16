@@ -152,7 +152,12 @@ function Unregister-Guard {
 function Get-GuardCount {
   $d = Get-GuardsDir
   if (-not (Test-Path $d)) { return 0 }
-  return @(Get-ChildItem -Path $d -File | Where-Object { $_.Name -notlike '.tmp-*' }).Count
+  # Correction 2: exclude '.stale.*' the same way '.tmp-*' is excluded above.
+  # The lock's break target (Invoke-WithStateLock, below) normally lives next
+  # to "guards", not inside it, but Windows has no dotfile convention -- a
+  # ".stale.*" entry anywhere Get-ChildItem -File can see it would otherwise
+  # be miscounted as a live guard and reintroduce the refcount bug.
+  return @(Get-ChildItem -Path $d -File | Where-Object { $_.Name -notlike '.tmp-*' -and $_.Name -notlike '.stale.*' }).Count
 }
 
 function Test-PidAlive {
@@ -178,7 +183,7 @@ function Test-PidAlive {
 function Remove-DeadGuards {
   $d = Get-GuardsDir
   if (-not (Test-Path $d)) { return }
-  foreach ($f in Get-ChildItem -Path $d -File | Where-Object { $_.Name -notlike '.tmp-*' }) {
+  foreach ($f in Get-ChildItem -Path $d -File | Where-Object { $_.Name -notlike '.tmp-*' -and $_.Name -notlike '.stale.*' }) {
     # A zero-byte (or otherwise unreadable) file is the canonical unparseable
     # guard file. Get-Content -Raw returns $null for an empty file, and
     # [regex]::Match($null, ...) throws MethodInvocationException rather than
@@ -204,6 +209,114 @@ function Remove-DeadGuards {
         Remove-Item $f.FullName -Force -ErrorAction Stop
       } catch [System.Management.Automation.ItemNotFoundException] {
       }
+    }
+  }
+}
+
+function Get-LockDir { return (Join-Path (Get-StateDir) 'lock') }
+
+# Windows twin of with_state_lock() in lib/state.sh -- see that function's
+# header comment for the full rationale. Serializes the guard's two critical
+# sections (startup claim+register, cleanup unregister+reap+restore) across
+# processes so the read-then-act sequences over guard files and the baseline
+# can never interleave. Only Windows-specific deltas are called out below.
+#
+# A directory is the mutex: New-Item -ItemType Directory -ErrorAction Stop
+# throws when the target already exists, which is the atomic test-and-set
+# (the same guarantee POSIX mkdir gives the sh twin). A Test-Path-then-create
+# sequence would race and must never replace it.
+#
+# Stale-lock recovery is mandatory, not optional -- a guard force-killed
+# while holding the lock must not wedge every future session forever (that
+# is the expected case here, not the exotic one). If the lock is held and
+# its recorded pid is not alive, break it by renaming the lock dir to a
+# private per-process name ([System.IO.Directory]::Move), then deleting the
+# renamed copy. Only one racer's rename can succeed -- the source vanishes
+# for everyone else the instant it wins -- which was verified experimentally
+# against NTFS before this was relied on (see task-9-report.md). A failed
+# rename means someone else already broke this lock instance first: fall
+# through and retry, and never fall back to deleting by the shared path --
+# that is exactly the two-winner bug the sh twin's history warns against
+# (two waiters both judging the same dead pid stale and both rm -rf'ing the
+# same path, the second hitting a lock a third process legitimately
+# recreated there).
+#
+# Ownership is verified both right after acquiring (in case our own
+# just-created lock was broken as stale before we finished stamping our pid
+# into it) and again before releasing (in case it was broken out from under
+# us while held, e.g. we looked dead to a waiter and got reaped by
+# mistake). Never remove a lock whose pid file doesn't hold our own pid --
+# it belongs to someone else now.
+#
+# Returns $null if the lock could not be acquired within MaxWaitSeconds --
+# callers MUST treat that as "the action did not run", never as success, and
+# fail loudly rather than proceeding unlocked. Otherwise returns whatever
+# $Action returned.
+function Invoke-WithStateLock {
+  param(
+    [Parameter(Mandatory=$true)][scriptblock]$Action,
+    [int]$MaxWaitSeconds = 5
+  )
+  try { Initialize-StateDirs } catch { return $null }
+  $lockDir = Get-LockDir
+  $pidFile = Join-Path $lockDir 'pid'
+  $waited = 0
+
+  while ($true) {
+    $created = $false
+    try {
+      New-Item -ItemType Directory -Path $lockDir -ErrorAction Stop | Out-Null
+      $created = $true
+    } catch {
+      $created = $false
+    }
+
+    if ($created) {
+      try { Set-Content -Path $pidFile -Value $PID -Encoding utf8 -ErrorAction Stop } catch {}
+      $readBack = $null
+      try { $readBack = (Get-Content -Path $pidFile -Raw -ErrorAction Stop).Trim() } catch {}
+      if ($readBack -eq "$PID") { break }
+      # Someone broke our just-created lock before we could stamp our own
+      # pid into it (or the write/read itself failed). Do not assume
+      # ownership -- retry from the top rather than proceeding.
+      continue
+    }
+
+    # Lock already held by someone else -- inspect the recorded holder.
+    $holder = $null
+    try { $holder = (Get-Content -Path $pidFile -Raw -ErrorAction Stop).Trim() } catch {}
+    $holderPid = 0
+    $holderParsed = $holder -and [int]::TryParse($holder, [ref]$holderPid)
+    if ($holderParsed -and -not (Test-PidAlive -ProcessId $holderPid)) {
+      $staleTarget = "$lockDir.stale.$PID"
+      $renamed = $false
+      try {
+        [System.IO.Directory]::Move($lockDir, $staleTarget)
+        $renamed = $true
+      } catch {
+        $renamed = $false
+      }
+      if ($renamed) {
+        Remove-Item -Path $staleTarget -Recurse -Force -ErrorAction SilentlyContinue
+      }
+      continue
+    }
+
+    if ($waited -ge $MaxWaitSeconds) {
+      [Console]::Error.WriteLine("stayawake: timed out waiting for state lock ($lockDir)")
+      return $null
+    }
+    Start-Sleep -Seconds 1
+    $waited++
+  }
+
+  try {
+    return (& $Action)
+  } finally {
+    $holder = $null
+    try { $holder = (Get-Content -Path $pidFile -Raw -ErrorAction SilentlyContinue).Trim() } catch {}
+    if ($holder -eq "$PID") {
+      Remove-Item -Path $lockDir -Recurse -Force -ErrorAction SilentlyContinue
     }
   }
 }
