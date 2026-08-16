@@ -80,29 +80,27 @@ function Invoke-SaSetup {
                                            -ExecutionTimeLimit ([TimeSpan]::Zero)
   $elevatedPrincipal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest -LogonType Interactive
 
-  # Only "Restore" gets a trigger (AtLogOn), and it stays pointed at
-  # lib/windows/lid.ps1 -- Invoke-RestoreState in lib/windows/platform.ps1
-  # (not modified here) always writes restore.state and then does
-  # `schtasks /run /tn "StayAwake\Restore"` expecting that exact Action;
-  # repointing it would break the guard's normal synchronous restore path.
-  # "Disable" is on-demand only, run exclusively via `schtasks /run` from
-  # Invoke-ApplyState -- passing an empty -Trigger array to
-  # Register-ScheduledTask for it is not equivalent to omitting the
-  # parameter, so the parameter is omitted entirely rather than passed as @().
+  # Neither "Disable" nor "Restore" gets a trigger -- both are purely
+  # elevated on-demand helpers, run exclusively via `schtasks /run` (from
+  # Invoke-ApplyState and Invoke-RestoreState in lib/windows/platform.ps1,
+  # not modified here). Round 2 fix: "Restore" used to also carry an AtLogOn
+  # trigger as the original login backstop, designed before BootRestore
+  # (below) existed. With both tasks firing at logon and no ordering
+  # guarantee between them, an overlap under Task Scheduler's default
+  # MultipleInstances=IgnoreNew silently drops whichever one loses the
+  # race -- and it's just as likely to drop BootRestore's corrective
+  # re-trigger as "Restore"'s own blind read of a stale restore.state,
+  # leaving the wrong value applied. BootRestore now owns logon
+  # exclusively (clear guards, restore from the real baseline, THEN
+  # schtasks-run this task) so there is exactly one entry point and
+  # nothing to race. Passing an empty -Trigger array to
+  # Register-ScheduledTask is not equivalent to omitting the parameter, so
+  # for both tasks the parameter is omitted entirely rather than passed as @().
   foreach ($action in $script:SaElevatedTaskNames) {
     $a = New-ScheduledTaskAction -Execute 'powershell.exe' `
          -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$lidScript`" -Action $action"
-    $registerArgs = @{
-      TaskName  = "StayAwake\$action"
-      Action    = $a
-      Principal = $elevatedPrincipal
-      Settings  = $settings
-      Force     = $true
-    }
-    if ($action -eq 'Restore') {
-      $registerArgs['Trigger'] = @(New-ScheduledTaskTrigger -AtLogOn)
-    }
-    Register-ScheduledTask @registerArgs | Out-Null
+    Register-ScheduledTask -TaskName "StayAwake\$action" -Action $a -Principal $elevatedPrincipal `
+                           -Settings $settings -Force | Out-Null
   }
 
   # BootRestore: the actual crash/reboot backstop. A hard reboot or power
