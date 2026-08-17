@@ -89,16 +89,23 @@ cleanup() {
   # pass may have already cleared, silently re-applying disablesleep=0.
   [ -n "${_sa_cleanup_done:-}" ] && return
   _sa_cleanup_done=1
+  # Release the idle assertion BEFORE taking the cleanup lock, not after.
+  # Cleanup's lock budget (below) is a deliberately long 30s -- under
+  # contention that is 30s of caffeinate still holding system idle sleep at
+  # bay, after the turn has already ended. The kill has nothing to do with
+  # the shared state lock (it only touches this guard's own child process),
+  # so it does not need to wait for it. Killing an already-dead PID is
+  # harmless. Matches the Windows twin, which releases its process-local
+  # assertion via Set-IdleAssertion before Invoke-WithStateLock.
+  [ -n "$CAFF_PID" ] && kill "$CAFF_PID" 2>/dev/null
   # Cleanup gets a materially longer lock budget than startup: timing out
   # unlocked here means power settings stay overridden with nothing left
   # that will ever restore them, which is worse than a slow exit.
   STAYAWAKE_LOCK_MAX_WAIT=30
   if with_state_lock _cleanup_locked "$SESSION" "$KIND"; then
-    [ -n "$CAFF_PID" ] && kill "$CAFF_PID" 2>/dev/null
     exit 0
   fi
   echo "stayawake: FATAL could not acquire the state lock during cleanup for session=$SESSION kind=$KIND after ${STAYAWAKE_LOCK_MAX_WAIT}s -- disablesleep was NOT restored and the baseline was NOT cleared. Guard file $(guard_file "$SESSION" "$KIND") is left registered; the next guard that successfully acquires the lock will reap this dead guard and restore automatically. If no other guard is running, check 'pmset -g' and restore disablesleep by hand." >&2
-  [ -n "$CAFF_PID" ] && kill "$CAFF_PID" 2>/dev/null
   exit 1
 }
 # The trap is armed only after registering. Arming it earlier would let an
