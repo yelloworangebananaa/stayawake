@@ -353,19 +353,18 @@ Assert-Eq -Actual ($out -join '') -Expected '' -Name 'restore-if-stale, empty ST
 # This is a real subprocess through the real platform.ps1: Get-LidActionLive
 # and the Modern Standby check are read-only `powercfg /query` / `powercfg /a`
 # calls, never a write. Safe to run unprivileged.
+#
+# This subprocess also hits the REAL Get-ScheduledTask cmdlet, so its grant
+# line reflects whatever StayAwake tasks genuinely happen to be registered on
+# the machine running this suite -- it must never assert on grant text (that
+# used to make this file red on any machine with the plugin actually
+# installed). The grant-state assertions live below instead, in-process,
+# against a stubbed Get-ScheduledTask that this subprocess never touches.
 $statusOut = (& powershell -NoProfile -ExecutionPolicy Bypass -File $stayawake -Verb status) -join "`n"
 $rcStatus = $LASTEXITCODE
 Assert-Eq -Actual $rcStatus -Expected 0 -Name 'status: exits 0 without setup or elevation'
-Assert-Eq -Actual ($statusOut -match 'grant:\s+NOT installed') -Expected $true -Name 'status: reports grant not installed'
 Assert-Eq -Actual ($statusOut -match 'guards:\s+0 active') -Expected $true -Name 'status: reports zero guards'
 Assert-Eq -Actual ($statusOut -match 'baseline:\s+none') -Expected $true -Name 'status: baseline reads none'
-# Fix 5: there is no `stayawake` binary on PATH -- the real interface is the
-# `/stayawake` slash command. The old message told users to run a command
-# that does not exist.
-Assert-Eq -Actual ($statusOut -match '/stayawake setup') -Expected $true `
-          -Name 'Fix 5: NOT installed message points at the /stayawake slash command, not a bare binary'
-Assert-Eq -Actual ($statusOut -match '(?<!/)stayawake setup') -Expected $false `
-          -Name 'Fix 5: NOT installed message never says the bare (non-slash) form'
 
 Remove-Item $emptyHome -Recurse -Force -ErrorAction SilentlyContinue
 
@@ -381,6 +380,25 @@ function New-FakeTask {
     Actions  = @(New-FakeTaskAction -Arguments "-NoProfile -File `"$ScriptPath`" -Action $TaskName")
   }
 }
+
+# None present -> "NOT installed", pointing users at the /stayawake setup
+# slash command. Hermetic replacement for the old subprocess-based "status:
+# reports grant not installed" / Fix 5 checks, which reached through to the
+# real Get-ScheduledTask cmdlet and only passed on a machine with no
+# StayAwake tasks actually registered.
+function Get-ScheduledTask {
+  param([string]$TaskName, [string]$TaskPath, $ErrorAction)
+  return $null
+}
+$out = (Invoke-SaStatus *>&1 | Out-String)
+Assert-Eq -Actual ($out -match 'grant:\s+NOT installed') -Expected $true -Name 'status: reports grant not installed'
+# Fix 5: there is no `stayawake` binary on PATH -- the real interface is the
+# `/stayawake` slash command. The old message told users to run a command
+# that does not exist.
+Assert-Eq -Actual ($out -match '/stayawake setup') -Expected $true `
+          -Name 'Fix 5: NOT installed message points at the /stayawake slash command, not a bare binary'
+Assert-Eq -Actual ($out -match '(?<!/)stayawake setup') -Expected $false `
+          -Name 'Fix 5: NOT installed message never says the bare (non-slash) form'
 
 # All three present -> "installed", no PARTIAL/BROKEN line.
 function Get-ScheduledTask {
