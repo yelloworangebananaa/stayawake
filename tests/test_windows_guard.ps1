@@ -105,6 +105,69 @@ Assert-Eq -Actual (@([regex]::Matches($log,'restore:')).Count) -Expected 1 `
 
 Remove-Item $env:STAYAWAKE_HOME -Recurse -Force -ErrorAction SilentlyContinue
 
+# --- Fix 2 regression: a stub that omits Set-IdleAssertion must not block
+# restore ---
+# Invoke-Cleanup in guard.ps1 calls Set-IdleAssertion unconditionally, but
+# the function is only DEFINED inside the non-stub branch. Any stub that
+# doesn't define it would previously make Invoke-Cleanup throw before the
+# restore lock is even taken -- the restore never runs, and the failure is
+# invisible unless something is actually stubbed this way. That is
+# structurally the same "the stub is the only thing that runs" shape as the
+# [uint32]0x80000000 bug that shipped behind 173 green assertions and
+# crashed the real guard on every Windows turn. This stub deliberately omits
+# Set-IdleAssertion to prove guard.ps1's fallback (a no-op defined only when
+# the real/stub platform didn't provide one) keeps the restore working.
+#
+# The stub also sets $ErrorActionPreference = 'Stop'. Dot-sourcing shares
+# scope, so this leaks into guard.ps1 itself, same as a real stub author
+# might reasonably do. Without it, PowerShell 5.1's default
+# CommandNotFoundException for a missing function is merely a non-terminating
+# error written to stderr -- the script would limp on and restore anyway,
+# which would make this test pass regardless of whether the fallback exists.
+# With it, the missing call is a genuine terminating exception, uncaught,
+# which is exactly the failure mode the fallback exists to prevent.
+New-Item -ItemType Directory -Force -Path $env:STAYAWAKE_HOME | Out-Null
+$stubNoAssertion = Join-Path $env:STAYAWAKE_HOME 'stub_platform_noassertion.ps1'
+@'
+$ErrorActionPreference = 'Stop'
+function Get-CurrentState { return "lidAc=1;lidDc=1" }
+function Invoke-ApplyState { Add-Content -Path $env:STAYAWAKE_STUB_LOG -Value "apply" }
+function Invoke-RestoreState { param([string]$Baseline) Add-Content -Path $env:STAYAWAKE_STUB_LOG -Value "restore:$Baseline" }
+function Get-PowerSource {
+  $p = $env:STAYAWAKE_STUB_POWER
+  if (-not $p) { $p = "ac 100" }
+  $parts = $p.Split(" ")
+  return [pscustomobject]@{ Source = $parts[0]; Percent = [int]$parts[1] }
+}
+# Deliberately no Set-IdleAssertion function here.
+'@ | Set-Content -Path $stubNoAssertion -Encoding utf8
+
+$env:STAYAWAKE_PLATFORM_STUB = $stubNoAssertion
+$env:STAYAWAKE_STUB_POWER = 'ac 100'
+
+Start-Process powershell -PassThru -WindowStyle Hidden `
+  -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',$guardQ,
+                '-SessionId','sess-noassert','-Kind','turn','-ParentPid',$PID | Out-Null
+
+$deadline = (Get-Date).AddSeconds(15)
+$log = ''
+while ((Get-Date) -lt $deadline) {
+  if (Test-Path $env:STAYAWAKE_STUB_LOG) {
+    $log = Get-Content $env:STAYAWAKE_STUB_LOG -Raw
+    if ($log -match '(?m)^apply\r?$') { break }
+  }
+  Start-Sleep -Milliseconds 500
+}
+Assert-Eq -Actual (@([regex]::Matches($log,'^apply\r?$','Multiline')).Count) -Expected 1 `
+          -Name 'stub omitting Set-IdleAssertion still applies'
+Remove-Item (Join-Path $env:STAYAWAKE_HOME 'guards\sess-noassert-turn') -Force
+Start-Sleep -Seconds 4
+$log = Get-Content $env:STAYAWAKE_STUB_LOG -Raw
+Assert-Eq -Actual (@([regex]::Matches($log,'restore:lidAc=1;lidDc=1')).Count) -Expected 1 `
+          -Name 'stub omitting Set-IdleAssertion still restores (Fix 2 regression)'
+
+Remove-Item $env:STAYAWAKE_HOME -Recurse -Force -ErrorAction SilentlyContinue
+
 # --- real Set-IdleAssertion path (no stub) ---
 # Every test above injects STAYAWAKE_PLATFORM_STUB, which replaces
 # Set-IdleAssertion wholesale -- the real function, and its literal [uint32]

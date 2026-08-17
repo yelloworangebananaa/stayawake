@@ -51,6 +51,17 @@ public static extern uint SetThreadExecutionState(uint esFlags);
   }
 }
 
+# Invoke-Cleanup calls Set-IdleAssertion unconditionally on every exit path,
+# including the restore. A stub loaded via STAYAWAKE_PLATFORM_STUB that
+# omits it must not make cleanup throw before the restore runs -- that would
+# be the exact "the stub is the only thing that runs" shape as the
+# [uint32]0x80000000 bug that shipped and crashed the real guard on every
+# Windows turn behind 173 green assertions. Fall back to a no-op so a
+# missing helper can never block the restore.
+if (-not (Get-Command Set-IdleAssertion -ErrorAction SilentlyContinue)) {
+  function Set-IdleAssertion { param([bool]$On) }
+}
+
 $poll = 30
 if ($env:STAYAWAKE_POLL) { $poll = [int]$env:STAYAWAKE_POLL }
 
