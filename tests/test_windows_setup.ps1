@@ -212,7 +212,7 @@ function Get-ScheduledTaskInfo {
 }
 
 Claim-Baseline -Text 'lidAc=1;lidDc=1' | Out-Null
-Invoke-SaUninstall | Out-Null
+$rc = Invoke-SaUninstall
 
 $unregistered = @(Get-Content $unregisterLog) | Sort-Object
 $expectedTasks = @($script:SaAllTaskNames) | Sort-Object
@@ -221,6 +221,7 @@ Assert-Eq -Actual ($unregistered -join ',') -Expected ($expectedTasks -join ',')
 $taskPaths = @(Get-Content $taskPathLog) | Sort-Object -Unique
 Assert-Eq -Actual ($taskPaths -join ',') -Expected '\StayAwake\' `
           -Name 'uninstall unregisters using the split TaskName/TaskPath form the real cmdlet requires'
+Assert-Eq -Actual $rc -Expected 0 -Name 'uninstall returns 0 on success'
 Assert-Eq -Actual ((Get-Content $uninstallRestoreLog -Raw).Trim()) -Expected 'restore:lidAc=1;lidDc=1' `
           -Name 'uninstall restores (force mode) before removing tasks'
 Assert-Eq -Actual (Test-Path $env:STAYAWAKE_HOME) -Expected $false -Name 'uninstall removes the state directory'
@@ -254,7 +255,7 @@ function Invoke-RestoreState {
 }
 
 Claim-Baseline -Text 'lidAc=1;lidDc=1' | Out-Null
-Invoke-SaUninstall -TimeoutSeconds 1 -PollMilliseconds 100 | Out-Null
+$rc = Invoke-SaUninstall -TimeoutSeconds 1 -PollMilliseconds 100
 
 Assert-Eq -Actual (Test-Path $timeoutUnregisterLog) -Expected $false `
           -Name 'C2 timeout: scheduled tasks left registered when the restore never completes'
@@ -266,6 +267,40 @@ Assert-Eq -Actual (Test-Path $timeoutUnregisterLog) -Expected $false `
 # is not torn down.
 Assert-Eq -Actual (Test-Path $env:STAYAWAKE_HOME) -Expected $true `
           -Name 'C2 timeout: state directory left intact so the still-registered task can still finish'
+Assert-Eq -Actual $rc -Expected 1 -Name 'C2 timeout: uninstall returns non-zero so a wrapper can tell it failed'
+# Timeout-retry fix: without rewriting original.state on timeout, a SECOND
+# uninstall attempt would find Read-Baseline empty ($hadBaseline = $false),
+# skip Wait-SaRestoreTaskComplete entirely, and go straight to unregistering
+# tasks + deleting state -- exactly the catastrophe the wait exists to
+# prevent. This is the direct, minimal check that the rewrite happened.
+Assert-Eq -Actual ([bool](Read-Baseline)) -Expected $true `
+          -Name 'timeout retry fix: baseline rewritten on timeout so a retry still has something to wait on'
+
+# --- the regression that actually matters: a SECOND uninstall attempt after
+# a timeout must still WAIT on the restore task, not skip straight to
+# deletion. This time the task genuinely finishes -- track whether the wait
+# actually polled at all, proving the retry did not take the no-baseline
+# shortcut.
+$script:retryPolled = $false
+$script:retryCalls = 0
+function Get-ScheduledTaskInfo {
+  param([string]$TaskName, $ErrorAction)
+  $script:retryPolled = $true
+  $script:retryCalls++
+  if ($script:retryCalls -le 3) {
+    return [pscustomobject]@{ LastRunTime = [datetime]'2020-01-01'; State = 'Running' }
+  }
+  return [pscustomobject]@{ LastRunTime = (Get-Date); State = 'Ready' }
+}
+$rc2 = Invoke-SaUninstall -TimeoutSeconds 5 -PollMilliseconds 100
+
+Assert-Eq -Actual $script:retryPolled -Expected $true `
+          -Name 'retry after timeout: second attempt still waits on the restore task instead of skipping straight to deletion'
+Assert-Eq -Actual $rc2 -Expected 0 -Name 'retry after timeout: succeeds once the restore genuinely completes'
+Assert-Eq -Actual (Test-Path $timeoutUnregisterLog) -Expected $true `
+          -Name 'retry after timeout: tasks unregistered once the wait actually completes'
+Assert-Eq -Actual (Test-Path $env:STAYAWAKE_HOME) -Expected $false `
+          -Name 'retry after timeout: state directory removed after a successful retry'
 
 Remove-Item $timeoutOutDir -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item $timeoutUnregisterLog -Force -ErrorAction SilentlyContinue

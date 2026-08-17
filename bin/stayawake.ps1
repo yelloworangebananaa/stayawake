@@ -27,7 +27,12 @@ $root = Split-Path -Parent $PSScriptRoot
 
 switch ($Verb) {
   'setup'     { Invoke-SaSetup -Root $root }
-  'uninstall' { Invoke-SaUninstall }
+  'uninstall' {
+    # Invoke-SaUninstall returns 0/1 so a wrapper can tell a timed-out
+    # revoke (still-registered admin tasks) apart from a real success --
+    # see its header comment in lib/windows/setup.ps1.
+    exit (Invoke-SaUninstall)
+  }
   'status'    { Invoke-SaStatus }
   'restore-if-stale' {
     $mode = ''

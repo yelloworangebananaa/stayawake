@@ -167,8 +167,10 @@ function Invoke-SaUninstall {
   # No-baseline case: if there is nothing to restore, Invoke-RestoreState
   # never runs and LastRunTime never advances -- do not block 30s on a no-op
   # uninstall. Capture whether a baseline exists BEFORE calling restore so
-  # that case is detected up front instead of waited out.
-  $hadBaseline = [bool](Read-Baseline)
+  # that case is detected up front instead of waited out. Capture the TEXT,
+  # not just presence -- the timeout path below needs to re-claim it verbatim.
+  $baseline = Read-Baseline
+  $hadBaseline = [bool]$baseline
   $baselineLastRun = [datetime]::MinValue
   if ($hadBaseline) {
     $info = Get-ScheduledTaskInfo -TaskName $restoreTaskName -ErrorAction SilentlyContinue
@@ -177,14 +179,32 @@ function Invoke-SaUninstall {
 
   # Restore first, with the force mode. Uninstalling while a guard is live
   # must never strand the user's lid setting once the grant is gone.
-  Invoke-SaRestoreIfStale -Mode 'force'
+  # Out-Null: Invoke-SaRestoreIfStale's own tail (Invoke-RestoreState /
+  # schtasks) can leave stray output on the pipeline; suppress it here so
+  # this function's own `return 0`/`return 1` below is the only thing a
+  # caller ever sees.
+  Invoke-SaRestoreIfStale -Mode 'force' | Out-Null
 
   if ($hadBaseline) {
     $completed = Wait-SaRestoreTaskComplete -TaskName $restoreTaskName -BaselineLastRunTime $baselineLastRun `
                                             -TimeoutSeconds $TimeoutSeconds -PollMilliseconds $PollMilliseconds
     if (-not $completed) {
+      # Timeout-retry fix: Invoke-SaRestoreIfStale already cleared
+      # original.state the moment the restore was QUEUED (Clear-Baseline
+      # runs right after Invoke-RestoreState there, well before this wait
+      # even starts) -- so by the time a timeout fires, the baseline file is
+      # already gone. Without rewriting it, a retried `stayawake uninstall`
+      # would find Read-Baseline empty, treat $hadBaseline as false, skip
+      # this wait entirely, and go straight to unregistering tasks and
+      # deleting the state dir -- lid setting stranded, no tasks, no state,
+      # no tooling left to fix it. Re-claim the SAME baseline text so a
+      # retry still has something to wait on. Safe to call Claim-Baseline
+      # here: Clear-Baseline already removed the file, so this is a fresh
+      # CreateNew, not a race with anything else (uninstall is not meant to
+      # run concurrently with itself).
+      Claim-Baseline -Text $baseline | Out-Null
       [Console]::Error.WriteLine("stayawake: WARNING -- restore did not finish within ${TimeoutSeconds}s. Leaving scheduled tasks and state in place so it can be retried; run `"stayawake uninstall`" again.")
-      return
+      return 1
     }
   }
 
@@ -213,6 +233,7 @@ function Invoke-SaUninstall {
   $d = Get-StateDir
   if (Test-Path $d) { Remove-Item $d -Recurse -Force }
   Write-Host 'stayawake: uninstalled. Scheduled tasks and state removed.'
+  return 0
 }
 
 # Restores stale power settings a guard left behind. Three modes, selected
