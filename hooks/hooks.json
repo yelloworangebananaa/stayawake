@@ -4,7 +4,7 @@
       {
         "hooks": [
           { "type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/hook.sh\" UserPromptSubmit" },
-          { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PLUGIN_ROOT}/bin/hook.ps1\" -Event UserPromptSubmit" }
+          { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PLUGIN_ROOT}/bin/hook.ps1\" -HookEvent UserPromptSubmit" }
         ]
       }
     ],
@@ -12,7 +12,7 @@
       {
         "hooks": [
           { "type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/hook.sh\" Stop" },
-          { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PLUGIN_ROOT}/bin/hook.ps1\" -Event Stop" }
+          { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PLUGIN_ROOT}/bin/hook.ps1\" -HookEvent Stop" }
         ]
       }
     ],
@@ -20,7 +20,7 @@
       {
         "hooks": [
           { "type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/hook.sh\" SessionEnd" },
-          { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PLUGIN_ROOT}/bin/hook.ps1\" -Event SessionEnd" }
+          { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PLUGIN_ROOT}/bin/hook.ps1\" -HookEvent SessionEnd" }
         ]
       }
     ]
