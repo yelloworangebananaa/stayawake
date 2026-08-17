@@ -153,8 +153,23 @@ $unregisterLog = Join-Path $uninstallOutDir 'unregister.log'
 $uninstallRestoreLog = Join-Path $uninstallOutDir 'restore.log'
 $raceLog = Join-Path $uninstallOutDir 'race.log'
 
+# I-critical fix: Get-ScheduledTask is the existence-check the fixed
+# Invoke-SaUninstall calls before unregistering each task; stub it truthy so
+# the loop actually reaches Unregister-ScheduledTask below.
+$taskPathLog = Join-Path $uninstallOutDir 'taskpath.log'
+function Get-ScheduledTask {
+  param([string]$TaskName, [string]$TaskPath, $ErrorAction)
+  return [pscustomobject]@{ TaskName = $TaskName; TaskPath = $TaskPath }
+}
 function Unregister-ScheduledTask {
-  param([string]$TaskName, [switch]$Confirm, $ErrorAction)
+  # TaskPath capture is the point of this stub. Unregister-ScheduledTask is a
+  # CDXML instance cmdlet whose TaskName lookup matches only the leaf CIM
+  # property ("Restore"), never the combined "StayAwake\Restore" form -- the
+  # old stub here asserted only that the loop iterated $script:SaAllTaskNames,
+  # never that the argument form would actually resolve against the real
+  # cmdlet. That is exactly what hid the bug. Recording -TaskPath and
+  # asserting on it below pins the split form.
+  param([string]$TaskName, [string]$TaskPath, [switch]$Confirm, $ErrorAction)
   # C2 regression guard: production's Invoke-RestoreState only QUEUES the
   # "Restore" task (schtasks /run returns on queue, not completion -- see
   # lib/windows/platform.ps1). Get-ScheduledTaskInfo below models that by
@@ -168,6 +183,7 @@ function Unregister-ScheduledTask {
     Add-Content -Path $raceLog -Value "RACE:$TaskName unregistered before Restore task finished"
   }
   Add-Content -Path $unregisterLog -Value $TaskName
+  Add-Content -Path $taskPathLog -Value $TaskPath
 }
 # Redefines the Invoke-RestoreState stub to log outside STAYAWAKE_HOME for
 # the same reason as $unregisterLog above; nothing later in this file needs
@@ -199,9 +215,12 @@ Claim-Baseline -Text 'lidAc=1;lidDc=1' | Out-Null
 Invoke-SaUninstall | Out-Null
 
 $unregistered = @(Get-Content $unregisterLog) | Sort-Object
-$expectedTasks = @($script:SaAllTaskNames | ForEach-Object { "StayAwake\$_" }) | Sort-Object
+$expectedTasks = @($script:SaAllTaskNames) | Sort-Object
 Assert-Eq -Actual ($unregistered -join ',') -Expected ($expectedTasks -join ',') `
           -Name 'uninstall unregisters exactly the tasks setup registers (Disable, Restore, BootRestore)'
+$taskPaths = @(Get-Content $taskPathLog) | Sort-Object -Unique
+Assert-Eq -Actual ($taskPaths -join ',') -Expected '\StayAwake\' `
+          -Name 'uninstall unregisters using the split TaskName/TaskPath form the real cmdlet requires'
 Assert-Eq -Actual ((Get-Content $uninstallRestoreLog -Raw).Trim()) -Expected 'restore:lidAc=1;lidDc=1' `
           -Name 'uninstall restores (force mode) before removing tasks'
 Assert-Eq -Actual (Test-Path $env:STAYAWAKE_HOME) -Expected $false -Name 'uninstall removes the state directory'

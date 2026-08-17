@@ -191,8 +191,24 @@ function Invoke-SaUninstall {
   # Iterates $script:SaAllTaskNames (Disable, Restore, BootRestore) -- see
   # that variable's definition above. An uninstall that leaves the logon
   # task behind is worse than not having one.
+  #
+  # Unregister-ScheduledTask is a CDXML instance cmdlet: its TaskName lookup
+  # matches only the leaf name held in the CIM property ("Restore"), never
+  # the combined "StayAwake\Restore" form Register-ScheduledTask accepts
+  # (that cmdlet splits it internally). The combined form here used to match
+  # nothing at all, -ErrorAction SilentlyContinue swallowed the failure, and
+  # uninstall printed "removed" while all three tasks -- including the two
+  # RunLevel Highest ones, the actual admin grant the user just asked to
+  # revoke -- stayed registered. -TaskPath is the split form
+  # Get-ScheduledTaskInfo/Get-ScheduledTask already use elsewhere in this
+  # file. Check existence first so "already absent" (a normal state if setup
+  # never ran) is silent, but let a genuine unregister failure throw -- a
+  # failed revoke must never be reported as success.
   foreach ($t in $script:SaAllTaskNames) {
-    Unregister-ScheduledTask -TaskName "StayAwake\$t" -Confirm:$false -ErrorAction SilentlyContinue
+    $existing = Get-ScheduledTask -TaskName $t -TaskPath '\StayAwake\' -ErrorAction SilentlyContinue
+    if ($existing) {
+      Unregister-ScheduledTask -TaskName $t -TaskPath '\StayAwake\' -Confirm:$false
+    }
   }
   $d = Get-StateDir
   if (Test-Path $d) { Remove-Item $d -Recurse -Force }
