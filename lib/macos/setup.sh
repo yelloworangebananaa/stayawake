@@ -14,8 +14,16 @@ AGENT_PLIST="$HOME/Library/LaunchAgents/com.stayawake.restore.plist"
 # The sed below is POSIX BRE (no \+, \s, \?, \|) so it behaves the same
 # under BSD sed (macOS) and GNU sed: anchor on the literal prefix, capture
 # the run of digits after "sec = ", discard the rest of the line.
+# Pure parse, callable directly on a string (no `sysctl` needed) so the
+# breakage-prone sed extraction is testable on its own: malformed or absent
+# input yields empty output (not a bogus epoch), which is what tells the
+# caller in sa_restore_if_stale to skip the wipe rather than guess.
+_parse_boot_time() {
+  sed -n 's/^{ sec = \([0-9][0-9]*\).*/\1/p'
+}
+
 _sa_boot_time() {
-  sysctl -n kern.boottime 2>/dev/null | sed -n 's/^{ sec = \([0-9][0-9]*\).*/\1/p'
+  sysctl -n kern.boottime 2>/dev/null | _parse_boot_time
 }
 
 _sa_file_mtime() { # file
@@ -151,8 +159,9 @@ sa_status() {
   if [ -f "$SUDOERS_FILE" ]; then
     echo "grant:      installed ($SUDOERS_FILE)"
   else
-    echo "grant:      NOT installed — run 'stayawake setup' for lid-close coverage"
+    echo "grant:      NOT installed — run '/stayawake setup' for lid-close coverage"
   fi
+  lid_available || echo "lid:        unavailable on this machine"
   echo "guards:     $(guard_count) active"
   echo "power:      $(power_source)"
   b=$(read_baseline)

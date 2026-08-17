@@ -32,8 +32,8 @@ power_source() {
 }
 
 apply_state() {
-  # Requires the sudoers grant installed by `stayawake setup`. Without it this
-  # prompts and hangs, so setup is what makes lid coverage available at all.
+  # Requires the sudoers grant installed by `/stayawake setup`. Without it
+  # this prompts and hangs, so setup is what makes lid coverage available.
   sudo -n pmset -a disablesleep 1 2>/dev/null
 }
 
@@ -43,6 +43,17 @@ restore_state() { # baseline_text
   sudo -n pmset -a disablesleep "$v" 2>/dev/null
 }
 
+# Reads `sysctl -n hw.model` on stdin, e.g. "MacBookPro18,3", "Macmini9,1",
+# "Mac13,1" (Mac Studio), "iMac21,1". Only MacBook* models have a lid, so
+# disablesleep's lid-close coverage is a no-op on every other Mac no matter
+# how well the sudoers grant is installed. Echoes "yes"/"no".
+parse_lid_model() {
+  case "$(cat)" in
+    MacBook*) printf 'yes' ;;
+    *) printf 'no' ;;
+  esac
+}
+
 lid_available() {
-  sudo -n pmset -g >/dev/null 2>&1
+  [ "$(sysctl -n hw.model 2>/dev/null | parse_lid_model)" = yes ]
 }

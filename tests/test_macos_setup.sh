@@ -14,6 +14,7 @@ RESTORE_LOG="$STAYAWAKE_HOME/restore.log"
 mkdir -p "$STAYAWAKE_HOME"
 restore_state() { echo "restore:$1" >> "$RESTORE_LOG"; } # baseline_text
 power_source()  { printf 'ac 100'; }
+lid_available() { return 0; } # default: has a lid, no status line
 
 . "$HERE/../lib/macos/setup.sh"
 
@@ -24,6 +25,14 @@ power_source()  { printf 'ac 100'; }
 # boot time (the ordinary case: a leftover from before a real reboot);
 # "postboot"-named files are newer (a guard registered by a session running
 # in the current boot, e.g. mid-turn during a fast-user-switch re-login).
+# --- _parse_boot_time: pure parse of the real `sysctl -n kern.boottime`
+# text, exercised directly (not through the stub below) so the actual sed
+# extraction in setup.sh runs against realistic input at least once. ---
+assert_eq "$(printf '{ sec = 1723526400, usec = 123456 } Fri Aug 12 12:00:00 2026\n' | _parse_boot_time)" \
+  "1723526400" "_parse_boot_time: normal kern.boottime output"
+assert_eq "$(printf '' | _parse_boot_time)" "" "_parse_boot_time: empty input yields empty"
+assert_eq "$(printf 'garbage nonsense\n' | _parse_boot_time)" "" "_parse_boot_time: malformed input yields empty, not a bogus epoch"
+
 FAKE_BOOT=2000000000
 _sa_boot_time() { printf '%s' "$FAKE_BOOT"; }
 _sa_file_mtime() { # file
@@ -159,6 +168,25 @@ case "$status_out" in
   *"grant:      installed ($SUDOERS_FILE)"*) assert_eq "ok" "ok" "status: grant reports installed when the file exists" ;;
   *) assert_eq "$status_out" "*grant installed*" "status: grant reports installed when the file exists" ;;
 esac
+
+# --- sa_status: lid line is silent when the machine has a lid ---
+lid_available() { return 0; }
+status_out=$(sa_status)
+case "$status_out" in
+  *"lid:"*) assert_eq "$status_out" "<no lid line>" "status: no lid line when lid_available is true" ;;
+  *) assert_eq "ok" "ok" "status: no lid line when lid_available is true" ;;
+esac
+
+# --- sa_status: lid line warns when the machine has no lid (Mac mini,
+# Mac Studio, iMac) -- this is the actual defect from Fix 1: a lid-less
+# Mac granted root got zero indication lid coverage would never engage ---
+lid_available() { return 1; }
+status_out=$(sa_status)
+case "$status_out" in
+  *"lid:        unavailable on this machine"*) assert_eq "ok" "ok" "status: lid line present when lid_available is false" ;;
+  *) assert_eq "$status_out" "*lid:        unavailable on this machine*" "status: lid line present when lid_available is false" ;;
+esac
+lid_available() { return 0; }
 
 rm -rf "$STAYAWAKE_HOME"
 finish
