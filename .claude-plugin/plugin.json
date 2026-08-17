@@ -1,7 +1,7 @@
 {
   "name": "stayawake",
   "description": "Keeps macOS and Windows awake through idle and lid close while Claude is working, and restores every setting afterwards",
-  "version": "0.1.0",
+  "version": "0.9.0",
   "author": { "name": "yelloworangebananaa" },
   "homepage": "https://github.com/yelloworangebananaa/stayawake",
   "repository": "https://github.com/yelloworangebananaa/stayawake",
