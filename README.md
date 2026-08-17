@@ -3,6 +3,12 @@
 Keeps your machine awake while Claude Code is working, and releases it the
 moment the turn ends — on macOS and Windows.
 
+**Published:** [github.com/yelloworangebananaa/stayawake](https://github.com/yelloworangebananaa/stayawake)
+· v0.9.0 · MIT
+
+This repository is itself a Claude Code plugin marketplace — installing it
+needs nothing but the two commands under [Install](#install).
+
 ## ⚠️ Status: unverified on real hardware
 
 This plugin was built and tested on a Windows desktop with **no lid** and
@@ -36,8 +42,18 @@ background.
 
 ```
 /plugin marketplace add yelloworangebananaa/stayawake
-/plugin install stayawake
+/plugin install stayawake@stayawake
 /stayawake setup
+```
+
+The `plugin@marketplace` form is required here because the plugin and the
+marketplace share the name `stayawake`.
+
+Already installed? Pick up a new version with:
+
+```
+/plugin marketplace update stayawake
+/plugin install stayawake@stayawake
 ```
 
 `setup` is optional — see [What `setup` grants](#what-setup-grants) below
