@@ -117,7 +117,15 @@ Remove-Item $env:STAYAWAKE_HOME -Recurse -Force -ErrorAction SilentlyContinue
 # straight out of bin/guard.ps1 and evaluate it here, so this test runs the
 # exact source the shipped guard runs -- not a hand-copied stand-in that
 # could drift from it, or paper over the same bug by construction.
-$guardSrc = Get-Content (Join-Path $here '..\bin\guard.ps1') -Raw
+# Normalized to LF before matching: .gitattributes declares *.ps1 text
+# eol=crlf, so a fresh clone's smudge filter delivers this file with CRLF
+# line endings even though this developer's working tree predates that
+# attribute and still holds LF. The explicit \n anchors below (and the
+# \n\} lookahead in particular) cannot match a preceding \r\n, so without
+# this normalization the regex fails to match on any fresh clone or CI
+# checkout -- Invoke-Expression then runs on an empty string, and
+# Set-IdleAssertion is never defined for the two calls below to exercise.
+$guardSrc = (Get-Content (Join-Path $here '..\bin\guard.ps1') -Raw) -replace "`r`n", "`n"
 $block = [regex]::Match($guardSrc, '(?s)Add-Type -Namespace SA.*?\n  \}(?=\n\})')
 Assert-Eq -Actual $block.Success -Expected $true -Name 'located the real Set-IdleAssertion block in guard.ps1'
 Invoke-Expression $block.Value
