@@ -223,18 +223,38 @@ function Invoke-SaUninstall {
 #           Test-PidAlive report it "live" and wedge the very backstop
 #           this mode exists to run. Correction 1: this mode therefore
 #           never calls Remove-DeadGuards or Get-GuardCount (both consult
-#           Test-PidAlive) -- it wipes the guards directory unconditionally
-#           via Remove-Item, then restores from the baseline if one
-#           exists. A boot path that delegates to a liveness-checking
-#           helper looks correct and preserves the bug; do not "simplify"
-#           this branch into a call to Remove-DeadGuards.
+#           Test-PidAlive) -- it wipes stale guard files unconditionally
+#           (no PID check), then restores from the baseline if one exists.
+#           A boot path that delegates to a liveness-checking helper looks
+#           correct and preserves the bug; do not "simplify" this branch
+#           into a call to Remove-DeadGuards.
+#
+#           I3 fix: this mode is reached via the BootRestore task's AtLogOn
+#           trigger, which also fires on RDP reconnect and fast user
+#           switching -- not just an actual reboot. Wiping every guard file
+#           unconditionally deleted a LIVE guard's file on a mid-turn logon;
+#           the guard's poll then saw its own file gone and ran cleanup,
+#           restoring mid-turn. Gate the wipe on file age vs. boot time:
+#           only a guard file written BEFORE this boot could belong to a
+#           process that died in the reboot. A live guard registered after
+#           boot (including one still running through a mid-session logon)
+#           writes its file after boot time and is left alone. On an actual
+#           reboot every guard file predates boot, so behavior there is
+#           unchanged. $BootTime is a parameter (default: the real boot
+#           time) purely so tests don't depend on this machine's uptime.
 function Invoke-SaRestoreIfStale {
-  param([string]$Mode = '')
+  param([string]$Mode = '', [datetime]$BootTime)
 
   switch ($Mode) {
     'boot' {
+      if (-not $PSBoundParameters.ContainsKey('BootTime')) {
+        $BootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+      }
       $d = Get-GuardsDir
-      if (Test-Path $d) { Remove-Item $d -Recurse -Force }
+      if (Test-Path $d) {
+        Get-ChildItem -Path $d -File | Where-Object { $_.LastWriteTime -lt $BootTime } |
+          ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+      }
     }
     'force' {
       Remove-DeadGuards

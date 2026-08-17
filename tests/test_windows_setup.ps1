@@ -70,6 +70,14 @@ Assert-Eq -Actual (Read-Baseline) -Expected '' -Name 'force: baseline cleared'
 Assert-Eq -Actual (Get-GuardCount) -Expected 1 -Name 'force: does not reap or remove the live guard file itself'
 Unregister-Guard -SessionId 'sess-live2' -Kind 'turn'
 
+# $futureBootTime: I3 fix gates the boot-mode wipe on file age vs. boot time
+# (see Invoke-SaRestoreIfStale's 'boot' branch and Get-SaBootTime injection).
+# The two tests below plant guard files "now" and expect them wiped the same
+# way the pre-fix unconditional wipe did -- pass a BootTime a few seconds in
+# the future so those files read as pre-boot, so this suite doesn't depend on
+# the real machine's uptime.
+$futureBootTime = (Get-Date).AddSeconds(5)
+
 # --- boot mode: a guard file whose PID happens to be alive (post-reboot PID
 # reuse) must NOT block the restore -- this is the whole point of
 # Correction 1. Normal mode with the same fixture would refuse to restore;
@@ -77,18 +85,39 @@ Unregister-Guard -SessionId 'sess-live2' -Kind 'turn'
 Claim-Baseline -Text 'lidAc=1;lidDc=1' | Out-Null
 Register-Guard -SessionId 'sess-reused-pid' -Kind 'turn' -GuardPid $PID -ParentPid $PID
 Reset-RestoreLog
-Invoke-SaRestoreIfStale -Mode 'boot'
+Invoke-SaRestoreIfStale -Mode 'boot' -BootTime $futureBootTime
 Assert-Eq -Actual (Get-RestoreLog) -Expected 'restore:lidAc=1;lidDc=1' -Name 'boot: restores despite a live-looking guard PID'
 Assert-Eq -Actual (Read-Baseline) -Expected '' -Name 'boot: baseline cleared'
-Assert-Eq -Actual (Get-GuardCount) -Expected 0 -Name 'boot: guards directory wiped unconditionally, no PID consulted'
+Assert-Eq -Actual (Get-GuardCount) -Expected 0 -Name 'boot: pre-boot guard file wiped, no PID consulted'
 
 # --- boot mode: no baseline -> guards still cleared, still silent, exit success ---
 New-Item -ItemType Directory -Force -Path (Get-GuardsDir) | Out-Null
 Set-Content -Path (Join-Path (Get-GuardsDir) 'leftover-guard') -Value 'junk' -Encoding utf8
 Reset-RestoreLog
-Invoke-SaRestoreIfStale -Mode 'boot'
+Invoke-SaRestoreIfStale -Mode 'boot' -BootTime $futureBootTime
 Assert-Eq -Actual (Get-RestoreLog) -Expected '' -Name 'boot, no baseline: restore never called'
-Assert-Eq -Actual (Get-GuardCount) -Expected 0 -Name 'boot, no baseline: guards directory still wiped'
+Assert-Eq -Actual (Get-GuardCount) -Expected 0 -Name 'boot, no baseline: pre-boot guard file still wiped'
+
+# --- I3 fix: boot mode must NOT wipe a guard file written AFTER boot time.
+# AtLogOn (which drives boot mode in production) also fires on RDP
+# reconnect / fast user switching, not just an actual reboot -- a mid-turn
+# logon must not delete the LIVE guard's file (that would make the guard's
+# poll see its file gone, break, and restore mid-turn). Plant one guard file
+# that predates a fake boot time and one that postdates it; only the
+# pre-boot one may be removed.
+New-Item -ItemType Directory -Force -Path (Get-GuardsDir) | Out-Null
+$fakeBoot = Get-Date
+$preBootFile  = Join-Path (Get-GuardsDir) 'sess-preboot-turn'
+$postBootFile = Join-Path (Get-GuardsDir) 'sess-postboot-turn'
+Set-Content -Path $preBootFile -Value "guard_pid=1`nparent_pid=1" -Encoding utf8
+(Get-Item $preBootFile).LastWriteTime = $fakeBoot.AddSeconds(-30)
+Set-Content -Path $postBootFile -Value "guard_pid=$PID`nparent_pid=$PID" -Encoding utf8
+(Get-Item $postBootFile).LastWriteTime = $fakeBoot.AddSeconds(30)
+
+Invoke-SaRestoreIfStale -Mode 'boot' -BootTime $fakeBoot
+Assert-Eq -Actual (Test-Path $preBootFile) -Expected $false -Name 'I3: pre-boot guard file removed'
+Assert-Eq -Actual (Test-Path $postBootFile) -Expected $true -Name 'I3: post-boot (mid-session logon) guard file left alone'
+Remove-Item $postBootFile -Force -ErrorAction SilentlyContinue
 
 # --- single source of truth: the task list Invoke-SaUninstall iterates is
 # built from the same names Invoke-SaSetup registers (see the
