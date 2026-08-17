@@ -84,12 +84,28 @@ function Get-PowerSource {
 }
 
 # The guard is unprivileged; the elevated scheduled tasks do the actual writes.
+#
+# Fix 4: `schtasks /run` is fire-and-forget -- a zero exit only means the run
+# was QUEUED, never that the elevated task actually finished (see
+# Wait-SaRestoreTaskComplete in lib/windows/setup.ps1 for the one place that
+# already accounts for this). So a zero exit here is not proof of anything
+# and must not be oversold. A NON-zero exit, though, means schtasks refused
+# to even queue the run -- e.g. the task was uninstalled while a guard is
+# still live -- and that silent no-op is worth surfacing. Warn to stderr and
+# keep going; a guard mid-cleanup must still complete its remaining teardown,
+# so this never throws.
 function Invoke-ApplyState {
   schtasks /run /tn "StayAwake\Disable" | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    [Console]::Error.WriteLine("stayawake: WARNING -- schtasks could not queue StayAwake\Disable (exit $LASTEXITCODE); lid override may not have been applied.")
+  }
 }
 
 function Invoke-RestoreState {
   param([string]$Baseline)
   Set-Content -Path (Join-Path (Get-StateDir) 'restore.state') -Value $Baseline -Encoding utf8
   schtasks /run /tn "StayAwake\Restore" | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    [Console]::Error.WriteLine("stayawake: WARNING -- schtasks could not queue StayAwake\Restore (exit $LASTEXITCODE); lid setting may not have been restored.")
+  }
 }

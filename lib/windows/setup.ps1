@@ -193,7 +193,7 @@ function Invoke-SaUninstall {
       # original.state the moment the restore was QUEUED (Clear-Baseline
       # runs right after Invoke-RestoreState there, well before this wait
       # even starts) -- so by the time a timeout fires, the baseline file is
-      # already gone. Without rewriting it, a retried `stayawake uninstall`
+      # already gone. Without rewriting it, a retried `/stayawake uninstall`
       # would find Read-Baseline empty, treat $hadBaseline as false, skip
       # this wait entirely, and go straight to unregistering tasks and
       # deleting the state dir -- lid setting stranded, no tasks, no state,
@@ -203,7 +203,7 @@ function Invoke-SaUninstall {
       # CreateNew, not a race with anything else (uninstall is not meant to
       # run concurrently with itself).
       Claim-Baseline -Text $baseline | Out-Null
-      [Console]::Error.WriteLine("stayawake: WARNING -- restore did not finish within ${TimeoutSeconds}s. Leaving scheduled tasks and state in place so it can be retried; run `"stayawake uninstall`" again.")
+      [Console]::Error.WriteLine("stayawake: WARNING -- restore did not finish within ${TimeoutSeconds}s. Leaving scheduled tasks and state in place so it can be retried; run `"/stayawake uninstall`" again.")
       return 1
     }
   }
@@ -284,13 +284,29 @@ function Invoke-SaRestoreIfStale {
 
   switch ($Mode) {
     'boot' {
+      # Fix 3 (parity with the macOS twin's _sa_boot_time / unparseable-boot
+      # handling): a failed Get-CimInstance used to leave $BootTime at
+      # [datetime]'s default (year 1), which made the -lt comparison below
+      # false for every file and silently skipped the wipe -- a safe
+      # outcome, but only by accident of the type default, not by design,
+      # and nothing told anyone it happened. Detect the failure explicitly,
+      # skip the wipe on purpose, and say so on stderr. Restore still
+      # proceeds unconditionally below either way.
+      $bootTimeKnown = $true
       if (-not $PSBoundParameters.ContainsKey('BootTime')) {
-        $BootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+        try {
+          $BootTime = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime
+        } catch {
+          $bootTimeKnown = $false
+          [Console]::Error.WriteLine('stayawake: could not determine boot time, skipping stale-guard cleanup (restore still proceeds)')
+        }
       }
-      $d = Get-GuardsDir
-      if (Test-Path $d) {
-        Get-ChildItem -Path $d -File | Where-Object { $_.LastWriteTime -lt $BootTime } |
-          ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+      if ($bootTimeKnown) {
+        $d = Get-GuardsDir
+        if (Test-Path $d) {
+          Get-ChildItem -Path $d -File | Where-Object { $_.LastWriteTime -lt $BootTime } |
+            ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+        }
       }
     }
     'force' {
@@ -309,12 +325,51 @@ function Invoke-SaRestoreIfStale {
   Write-Host 'stayawake: restored stale power settings.'
 }
 
+# Pure helper: pulls the "-File ""<path>""" argument out of a scheduled
+# task action's Arguments string. Split out of Invoke-SaStatus, same reason
+# as Get-SaBootRestoreArgument above, so Fix 2's path-resolves check is
+# testable without touching Get-ScheduledTask or the filesystem.
+function Get-SaTaskScriptPath {
+  param([string]$Arguments)
+  $m = [regex]::Match($Arguments, '-File\s+"([^"]+)"')
+  if ($m.Success) { return $m.Groups[1].Value }
+  return ''
+}
+
 function Invoke-SaStatus {
-  $task = Get-ScheduledTask -TaskName 'Disable' -TaskPath '\StayAwake\' -ErrorAction SilentlyContinue
-  if ($task) {
+  # Fix 1: probing only "Disable" reported grant:installed on a partial
+  # install (or one predating BootRestore) -- the crash-recovery logon
+  # backstop could be silently absent. Check the whole set
+  # ($script:SaAllTaskNames is the single source of truth Invoke-SaSetup
+  # registers from and Invoke-SaUninstall tears down from) and say which
+  # names are missing rather than a bare yes/no.
+  $present = @()
+  $broken = @()
+  foreach ($t in $script:SaAllTaskNames) {
+    $task = Get-ScheduledTask -TaskName $t -TaskPath '\StayAwake\' -ErrorAction SilentlyContinue
+    if (-not $task) { continue }
+    $present += $t
+    # Fix 2: each task's Action embeds an absolute path to a repo script
+    # (lid.ps1 for Disable/Restore, bin\stayawake.ps1 for BootRestore). A
+    # plugin update that relocates the install root leaves the task
+    # registered but pointing at nothing -- including the logon backstop,
+    # one of the four restore triggers -- and nothing else would ever
+    # notice. Surface it here instead of waiting for a lid close to find it.
+    if ($task.Actions -and $task.Actions.Count -gt 0) {
+      $p = Get-SaTaskScriptPath -Arguments $task.Actions[0].Arguments
+      if ($p -and -not (Test-Path $p)) { $broken += "$t -> $p" }
+    }
+  }
+  if ($present.Count -eq $script:SaAllTaskNames.Count) {
     Write-Host 'grant:      installed (StayAwake scheduled tasks)'
+  } elseif ($present.Count -eq 0) {
+    Write-Host 'grant:      NOT installed - run "/stayawake setup" for lid-close coverage'
   } else {
-    Write-Host 'grant:      NOT installed - run "stayawake setup" for lid-close coverage'
+    $missing = $script:SaAllTaskNames | Where-Object { $present -notcontains $_ }
+    Write-Host "grant:      PARTIAL - present: $($present -join ', '); missing: $($missing -join ', ') - run `"/stayawake setup`" to repair"
+  }
+  if ($broken.Count -gt 0) {
+    Write-Host "grant:      BROKEN - install root relocated? task script path missing: $($broken -join '; ')"
   }
   $lid = Get-LidActionLive
   if (-not $lid.Present) { Write-Host 'lid:        unavailable on this machine' }

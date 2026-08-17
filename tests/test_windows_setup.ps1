@@ -359,6 +359,159 @@ Assert-Eq -Actual $rcStatus -Expected 0 -Name 'status: exits 0 without setup or 
 Assert-Eq -Actual ($statusOut -match 'grant:\s+NOT installed') -Expected $true -Name 'status: reports grant not installed'
 Assert-Eq -Actual ($statusOut -match 'guards:\s+0 active') -Expected $true -Name 'status: reports zero guards'
 Assert-Eq -Actual ($statusOut -match 'baseline:\s+none') -Expected $true -Name 'status: baseline reads none'
+# Fix 5: there is no `stayawake` binary on PATH -- the real interface is the
+# `/stayawake` slash command. The old message told users to run a command
+# that does not exist.
+Assert-Eq -Actual ($statusOut -match '/stayawake setup') -Expected $true `
+          -Name 'Fix 5: NOT installed message points at the /stayawake slash command, not a bare binary'
+Assert-Eq -Actual ($statusOut -match '(?<!/)stayawake setup') -Expected $false `
+          -Name 'Fix 5: NOT installed message never says the bare (non-slash) form'
 
 Remove-Item $emptyHome -Recurse -Force -ErrorAction SilentlyContinue
+
+# --- Fix 1: Invoke-SaStatus must probe the whole task set, not just Disable,
+# so a partial install (or one predating BootRestore) is visible instead of
+# silently reporting "installed". Stub Get-ScheduledTask in-process; these
+# are pure decision-logic tests, not live Task Scheduler calls.
+function New-FakeTaskAction { param([string]$Arguments) [pscustomobject]@{ Execute = 'powershell.exe'; Arguments = $Arguments } }
+function New-FakeTask {
+  param([string]$TaskName, [string]$ScriptPath = 'C:\fake\ok.ps1')
+  [pscustomobject]@{
+    TaskName = $TaskName
+    Actions  = @(New-FakeTaskAction -Arguments "-NoProfile -File `"$ScriptPath`" -Action $TaskName")
+  }
+}
+
+# All three present -> "installed", no PARTIAL/BROKEN line.
+function Get-ScheduledTask {
+  param([string]$TaskName, [string]$TaskPath, $ErrorAction)
+  return New-FakeTask -TaskName $TaskName -ScriptPath $PSCommandPath
+}
+$out = (Invoke-SaStatus *>&1 | Out-String)
+Assert-Eq -Actual ($out -match 'grant:\s+installed') -Expected $true -Name 'Fix 1: all three tasks present reports installed'
+Assert-Eq -Actual ($out -match 'PARTIAL') -Expected $false -Name 'Fix 1: complete install never reports PARTIAL'
+
+# Only "Disable" present (the exact partial-install scenario the fix
+# targets: an old install predating BootRestore, or one interrupted
+# mid-setup) -> must NOT report "installed", and must name what's missing.
+function Get-ScheduledTask {
+  param([string]$TaskName, [string]$TaskPath, $ErrorAction)
+  if ($TaskName -eq 'Disable') { return New-FakeTask -TaskName $TaskName -ScriptPath $PSCommandPath }
+  return $null
+}
+$out = (Invoke-SaStatus *>&1 | Out-String)
+Assert-Eq -Actual ($out -match 'grant:\s+installed \(') -Expected $false `
+          -Name 'Fix 1: partial install (Disable only) never reports bare installed'
+Assert-Eq -Actual ($out -match 'PARTIAL') -Expected $true -Name 'Fix 1: partial install reports PARTIAL'
+Assert-Eq -Actual ($out -match 'Restore') -Expected $true -Name 'Fix 1: partial install names the missing Restore task'
+Assert-Eq -Actual ($out -match 'BootRestore') -Expected $true -Name 'Fix 1: partial install names the missing BootRestore task (the logon backstop)'
+
+# --- Fix 2: Get-SaTaskScriptPath is the pure string extractor behind the
+# path-resolves check -- verify it directly, same pattern as
+# Get-SaBootRestoreArgument above.
+$extracted = Get-SaTaskScriptPath -Arguments '-NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\stayawake\lib\windows\lid.ps1" -Action Disable'
+Assert-Eq -Actual $extracted -Expected 'C:\Program Files\stayawake\lib\windows\lid.ps1' `
+          -Name 'Fix 2: Get-SaTaskScriptPath extracts the quoted -File path'
+Assert-Eq -Actual (Get-SaTaskScriptPath -Arguments '-NoProfile -Verb restore-if-stale') -Expected '' `
+          -Name 'Fix 2: Get-SaTaskScriptPath returns empty when there is no -File argument'
+
+# All three tasks registered, but the embedded script path does not exist on
+# disk -- the relocated-install-root scenario the fix targets. Every task
+# must be checked, including BootRestore (one of the four restore triggers).
+function Get-ScheduledTask {
+  param([string]$TaskName, [string]$TaskPath, $ErrorAction)
+  return New-FakeTask -TaskName $TaskName -ScriptPath 'C:\this\path\does\not\exist\stayawake\lid.ps1'
+}
+$out = (Invoke-SaStatus *>&1 | Out-String)
+Assert-Eq -Actual ($out -match 'BROKEN') -Expected $true -Name 'Fix 2: relocated install root is reported as BROKEN'
+Assert-Eq -Actual ($out -match 'Disable') -Expected $true -Name 'Fix 2: BROKEN line names the Disable task'
+Assert-Eq -Actual ($out -match 'Restore') -Expected $true -Name 'Fix 2: BROKEN line names the Restore task'
+Assert-Eq -Actual ($out -match 'BootRestore') -Expected $true -Name 'Fix 2: BROKEN line names the BootRestore task (the logon backstop)'
+
+# Control: all three present and pointing at a real, existing file -> no
+# BROKEN line. Proves the check discriminates on resolvability, not merely
+# on the task existing.
+function Get-ScheduledTask {
+  param([string]$TaskName, [string]$TaskPath, $ErrorAction)
+  return New-FakeTask -TaskName $TaskName -ScriptPath $PSCommandPath
+}
+$out = (Invoke-SaStatus *>&1 | Out-String)
+Assert-Eq -Actual ($out -match 'BROKEN') -Expected $false -Name 'Fix 2: a resolvable install root never reports BROKEN'
+
+# --- Fix 3: boot mode must not silently no-op when boot time can't be
+# determined -- warn to stderr, skip the wipe on purpose, and still restore.
+# Run as a real subprocess: [Console]::Error.WriteLine bypasses PowerShell's
+# error stream and writes to the OS stderr handle directly, which only a
+# child process's stream redirection (2>&1 on a native invocation) reliably
+# captures.
+$bootFailDir = Join-Path $tempDir "stayawake-bootfail-$PID"
+if (Test-Path $bootFailDir) { Remove-Item $bootFailDir -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $bootFailDir | Out-Null
+$bootFailHome = Join-Path $bootFailDir 'home'
+$bootFailRestoreLog = Join-Path $bootFailDir 'restore.log'
+$bootFailScript = Join-Path $bootFailDir 'run.ps1'
+$libStatePath = (Join-Path $here '..\lib\state.ps1')
+$libSetupPath = (Join-Path $here '..\lib\windows\setup.ps1')
+@"
+`$env:STAYAWAKE_HOME = '$bootFailHome'
+. '$libStatePath'
+# Shadowing Get-CimInstance with a function: PowerShell resolves an
+# unqualified command to a function ahead of a cmdlet of the same name, so
+# this fails the boot-time lookup without touching WMI/CIM at all.
+function Get-CimInstance { throw 'simulated WMI failure' }
+. '$libSetupPath'
+function Invoke-RestoreState { param([string]`$Baseline) Add-Content -Path '$bootFailRestoreLog' -Value "restore:`$Baseline" }
+Claim-Baseline -Text 'lidAc=9;lidDc=9' | Out-Null
+New-Item -ItemType Directory -Force -Path (Get-GuardsDir) | Out-Null
+Set-Content -Path (Join-Path (Get-GuardsDir) 'leftover-guard') -Value 'junk' -Encoding utf8
+Invoke-SaRestoreIfStale -Mode 'boot'
+if (Test-Path (Join-Path (Get-GuardsDir) 'leftover-guard')) { Write-Host 'GUARD-STILL-PRESENT' }
+"@ | Set-Content -Path $bootFailScript -Encoding utf8
+$bootFailOut = (& powershell -NoProfile -ExecutionPolicy Bypass -File $bootFailScript 2>&1 | Out-String)
+Assert-Eq -Actual ($bootFailOut -match 'could not determine boot time') -Expected $true `
+          -Name 'Fix 3: unparseable boot time warns to stderr'
+Assert-Eq -Actual ($bootFailOut -match 'GUARD-STILL-PRESENT') -Expected $true `
+          -Name 'Fix 3: unparseable boot time skips the wipe (safe direction preserved)'
+Assert-Eq -Actual ((Get-Content $bootFailRestoreLog -Raw).Trim()) -Expected 'restore:lidAc=9;lidDc=9' `
+          -Name 'Fix 3: restore still proceeds when boot time is unknown'
+Remove-Item $bootFailDir -Recurse -Force -ErrorAction SilentlyContinue
+
+# --- Fix 4: schtasks exit codes in lib/windows/platform.ps1's
+# Invoke-ApplyState / Invoke-RestoreState were discarded. A non-zero exit
+# means the run was never even queued (e.g. the task was uninstalled while a
+# guard is still live) and must be surfaced on stderr -- but never thrown,
+# since a guard mid-cleanup must still finish its remaining teardown. Real
+# subprocess for the same [Console]::Error.WriteLine reason as Fix 3.
+$schtasksFailDir = Join-Path $tempDir "stayawake-schtasksfail-$PID"
+if (Test-Path $schtasksFailDir) { Remove-Item $schtasksFailDir -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $schtasksFailDir | Out-Null
+$schtasksFailHome = Join-Path $schtasksFailDir 'home'
+New-Item -ItemType Directory -Force -Path $schtasksFailHome | Out-Null
+$schtasksFailScript = Join-Path $schtasksFailDir 'run.ps1'
+$libPlatformPath = (Join-Path $here '..\lib\windows\platform.ps1')
+@"
+`$env:STAYAWAKE_HOME = '$schtasksFailHome'
+. '$libStatePath'
+# Shadowing schtasks with a function the same way the repo's own tests
+# shadow Unregister-ScheduledTask elsewhere: PowerShell resolves an
+# unqualified command to a function ahead of a native executable of the same
+# name, so this simulates a failed queue attempt without touching Task
+# Scheduler.
+function schtasks { `$global:LASTEXITCODE = 1; return 'ERROR: The system cannot find the file specified.' }
+. '$libPlatformPath'
+Invoke-ApplyState
+Invoke-RestoreState -Baseline 'lidAc=2;lidDc=2'
+Write-Host 'REACHED-END'
+"@ | Set-Content -Path $schtasksFailScript -Encoding utf8
+$schtasksFailOut = (& powershell -NoProfile -ExecutionPolicy Bypass -File $schtasksFailScript 2>&1 | Out-String)
+Assert-Eq -Actual ($schtasksFailOut -match 'StayAwake\\Disable') -Expected $true `
+          -Name 'Fix 4: Invoke-ApplyState warns on stderr when schtasks fails to queue Disable'
+Assert-Eq -Actual ($schtasksFailOut -match 'StayAwake\\Restore') -Expected $true `
+          -Name 'Fix 4: Invoke-RestoreState warns on stderr when schtasks fails to queue Restore'
+Assert-Eq -Actual ($schtasksFailOut -match 'REACHED-END') -Expected $true `
+          -Name 'Fix 4: a failed schtasks queue does not throw -- caller teardown still completes'
+Assert-Eq -Actual (Test-Path (Join-Path $schtasksFailHome 'restore.state')) -Expected $true `
+          -Name 'Fix 4: restore.state is still written even when schtasks fails to queue the run'
+Remove-Item $schtasksFailDir -Recurse -Force -ErrorAction SilentlyContinue
+
 Complete-Tests
