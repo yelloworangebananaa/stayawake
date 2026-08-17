@@ -124,10 +124,70 @@ function Invoke-SaSetup {
   Write-Host 'stayawake: setup complete.'
 }
 
+# Invoke-RestoreState (lib/windows/platform.ps1) has no synchronous mode: it
+# writes restore.state then `schtasks /run`s the "Restore" task, which
+# returns the instant the task is QUEUED, not when it finishes. Polls
+# Get-ScheduledTaskInfo until LastRunTime has moved past $BaselineLastRunTime
+# AND the task is no longer 'Running'. Pulled out of Invoke-SaUninstall so
+# tests can drive it with a short timeout/poll interval instead of the real
+# 30s production default.
+function Wait-SaRestoreTaskComplete {
+  param(
+    [string]$TaskName,
+    [datetime]$BaselineLastRunTime = [datetime]::MinValue,
+    [int]$TimeoutSeconds = 30,
+    [int]$PollMilliseconds = 250
+  )
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  while ($true) {
+    $info = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($info -and $info.LastRunTime -gt $BaselineLastRunTime -and $info.State -ne 'Running') {
+      return $true
+    }
+    if ((Get-Date) -ge $deadline) { return $false }
+    Start-Sleep -Milliseconds $PollMilliseconds
+  }
+}
+
 function Invoke-SaUninstall {
+  # C2 fix: `Invoke-SaRestoreIfStale -Mode force` only QUEUES the "Restore"
+  # task (see Wait-SaRestoreTaskComplete above); it does not wait for it. The
+  # old code unregistered StayAwake\Restore and deleted the state dir
+  # microseconds later, which could win the race against the task actually
+  # running -- lid action stranded at "do nothing" with every scheduled task
+  # and the restore.state input file already gone, and no tooling left to
+  # undo it. Wait for the task to actually finish before tearing anything
+  # down; on timeout, leave the tasks and state in place so the user has a
+  # working uninstall to retry, rather than a silent permanent override.
+  # TimeoutSeconds/PollMilliseconds are parameters (defaults match
+  # production) purely so tests can force a fast timeout without a real 30s
+  # wait -- callers should never need to pass these.
+  param([int]$TimeoutSeconds = 30, [int]$PollMilliseconds = 250)
+  $restoreTaskName = 'StayAwake\Restore'
+  # No-baseline case: if there is nothing to restore, Invoke-RestoreState
+  # never runs and LastRunTime never advances -- do not block 30s on a no-op
+  # uninstall. Capture whether a baseline exists BEFORE calling restore so
+  # that case is detected up front instead of waited out.
+  $hadBaseline = [bool](Read-Baseline)
+  $baselineLastRun = [datetime]::MinValue
+  if ($hadBaseline) {
+    $info = Get-ScheduledTaskInfo -TaskName $restoreTaskName -ErrorAction SilentlyContinue
+    if ($info -and $info.LastRunTime) { $baselineLastRun = $info.LastRunTime }
+  }
+
   # Restore first, with the force mode. Uninstalling while a guard is live
   # must never strand the user's lid setting once the grant is gone.
   Invoke-SaRestoreIfStale -Mode 'force'
+
+  if ($hadBaseline) {
+    $completed = Wait-SaRestoreTaskComplete -TaskName $restoreTaskName -BaselineLastRunTime $baselineLastRun `
+                                            -TimeoutSeconds $TimeoutSeconds -PollMilliseconds $PollMilliseconds
+    if (-not $completed) {
+      [Console]::Error.WriteLine("stayawake: WARNING -- restore did not finish within ${TimeoutSeconds}s. Leaving scheduled tasks and state in place so it can be retried; run `"stayawake uninstall`" again.")
+      return
+    }
+  }
+
   # Iterates $script:SaAllTaskNames (Disable, Restore, BootRestore) -- see
   # that variable's definition above. An uninstall that leaves the logon
   # task behind is worse than not having one.

@@ -122,9 +122,22 @@ if (Test-Path $uninstallOutDir) { Remove-Item $uninstallOutDir -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $uninstallOutDir | Out-Null
 $unregisterLog = Join-Path $uninstallOutDir 'unregister.log'
 $uninstallRestoreLog = Join-Path $uninstallOutDir 'restore.log'
+$raceLog = Join-Path $uninstallOutDir 'race.log'
 
 function Unregister-ScheduledTask {
   param([string]$TaskName, [switch]$Confirm, $ErrorAction)
+  # C2 regression guard: production's Invoke-RestoreState only QUEUES the
+  # "Restore" task (schtasks /run returns on queue, not completion -- see
+  # lib/windows/platform.ps1). Get-ScheduledTaskInfo below models that by
+  # reporting the task as still 'Running' for its first few polls before
+  # flipping to completed. If Unregister-ScheduledTask is reached before
+  # that flip, the code under test unregistered/deleted the restore
+  # mechanism while the real-world restore could still be in flight -- the
+  # exact race C2 describes. Record it rather than failing loudly here so
+  # every subsequent assertion in this block still runs.
+  if (-not $script:restoreTaskCompleted) {
+    Add-Content -Path $raceLog -Value "RACE:$TaskName unregistered before Restore task finished"
+  }
   Add-Content -Path $unregisterLog -Value $TaskName
 }
 # Redefines the Invoke-RestoreState stub to log outside STAYAWAKE_HOME for
@@ -133,6 +146,24 @@ function Unregister-ScheduledTask {
 function Invoke-RestoreState {
   param([string]$Baseline)
   Add-Content -Path $uninstallRestoreLog -Value "restore:$Baseline"
+}
+
+# Async Get-ScheduledTaskInfo stub: call 1 is Invoke-SaUninstall's baseline
+# LastRunTime capture (before the restore is even queued); calls 2 and 3
+# simulate the task still being 'Running' (queued but not finished); call 4+
+# reports it finished with an advanced LastRunTime. Only the fixed code
+# (which polls via Wait-SaRestoreTaskComplete) can ever observe the
+# completed state before touching Unregister-ScheduledTask.
+$script:sgtiCalls = 0
+$script:restoreTaskCompleted = $false
+function Get-ScheduledTaskInfo {
+  param([string]$TaskName, $ErrorAction)
+  $script:sgtiCalls++
+  if ($script:sgtiCalls -le 3) {
+    return [pscustomobject]@{ LastRunTime = [datetime]'2020-01-01'; State = 'Running' }
+  }
+  $script:restoreTaskCompleted = $true
+  return [pscustomobject]@{ LastRunTime = (Get-Date); State = 'Ready' }
 }
 
 Claim-Baseline -Text 'lidAc=1;lidDc=1' | Out-Null
@@ -145,9 +176,75 @@ Assert-Eq -Actual ($unregistered -join ',') -Expected ($expectedTasks -join ',')
 Assert-Eq -Actual ((Get-Content $uninstallRestoreLog -Raw).Trim()) -Expected 'restore:lidAc=1;lidDc=1' `
           -Name 'uninstall restores (force mode) before removing tasks'
 Assert-Eq -Actual (Test-Path $env:STAYAWAKE_HOME) -Expected $false -Name 'uninstall removes the state directory'
+Assert-Eq -Actual (Test-Path $raceLog) -Expected $false `
+          -Name 'C2: uninstall waits for the async Restore task to finish before unregistering (no race)'
 
 Remove-Item $uninstallOutDir -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item $env:STAYAWAKE_HOME -Recurse -Force -ErrorAction SilentlyContinue
+
+# --- C2: on timeout, leave tasks registered and state intact rather than
+# stranding the user with no tooling. Get-ScheduledTaskInfo below never
+# reports completion, forcing Wait-SaRestoreTaskComplete to time out; a
+# short TimeoutSeconds/PollMilliseconds keeps this test fast.
+$timeoutOutDir = Join-Path $tempDir "stayawake-uninstalltimeouttest-$PID"
+if (Test-Path $timeoutOutDir) { Remove-Item $timeoutOutDir -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $timeoutOutDir | Out-Null
+$env:STAYAWAKE_HOME = $timeoutOutDir
+$timeoutUnregisterLog = Join-Path $tempDir "stayawake-timeout-unregister-$PID.log"
+if (Test-Path $timeoutUnregisterLog) { Remove-Item $timeoutUnregisterLog -Force }
+
+function Get-ScheduledTaskInfo {
+  param([string]$TaskName, $ErrorAction)
+  return [pscustomobject]@{ LastRunTime = [datetime]'2020-01-01'; State = 'Running' }
+}
+function Unregister-ScheduledTask {
+  param([string]$TaskName, [switch]$Confirm, $ErrorAction)
+  Add-Content -Path $timeoutUnregisterLog -Value $TaskName
+}
+function Invoke-RestoreState {
+  param([string]$Baseline)
+}
+
+Claim-Baseline -Text 'lidAc=1;lidDc=1' | Out-Null
+Invoke-SaUninstall -TimeoutSeconds 1 -PollMilliseconds 100 | Out-Null
+
+Assert-Eq -Actual (Test-Path $timeoutUnregisterLog) -Expected $false `
+          -Name 'C2 timeout: scheduled tasks left registered when the restore never completes'
+# Baseline bookkeeping (original.state) is cleared by Invoke-SaRestoreIfStale
+# itself as soon as the restore is queued -- unrelated to whether the
+# scheduled task has finished. What matters for the retry story is that the
+# task stays registered (asserted above) and restore.state -- the file the
+# still-running task actually needs -- survives because the state dir below
+# is not torn down.
+Assert-Eq -Actual (Test-Path $env:STAYAWAKE_HOME) -Expected $true `
+          -Name 'C2 timeout: state directory left intact so the still-registered task can still finish'
+
+Remove-Item $timeoutOutDir -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item $timeoutUnregisterLog -Force -ErrorAction SilentlyContinue
+
+# --- C2: no baseline -> uninstall does not block ~30s waiting on a no-op ---
+$noBaselineOutDir = Join-Path $tempDir "stayawake-uninstallnobaseline-$PID"
+if (Test-Path $noBaselineOutDir) { Remove-Item $noBaselineOutDir -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $noBaselineOutDir | Out-Null
+$env:STAYAWAKE_HOME = $noBaselineOutDir
+$script:sgtiCalledForNoBaseline = $false
+function Get-ScheduledTaskInfo {
+  param([string]$TaskName, $ErrorAction)
+  $script:sgtiCalledForNoBaseline = $true
+  return [pscustomobject]@{ LastRunTime = [datetime]'2020-01-01'; State = 'Ready' }
+}
+function Unregister-ScheduledTask {
+  param([string]$TaskName, [switch]$Confirm, $ErrorAction)
+}
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+Invoke-SaUninstall | Out-Null
+$sw.Stop()
+Assert-Eq -Actual ($sw.Elapsed.TotalSeconds -lt 5) -Expected $true `
+          -Name 'C2: no-baseline uninstall returns quickly, does not wait out the timeout'
+Assert-Eq -Actual $script:sgtiCalledForNoBaseline -Expected $false `
+          -Name 'C2: no-baseline uninstall never polls Get-ScheduledTaskInfo (nothing was queued to wait for)'
+
+Remove-Item $noBaselineOutDir -Recurse -Force -ErrorAction SilentlyContinue
 
 # --- verb dispatch through bin/stayawake.ps1, run as real subprocesses so the
 # real ValidateSet / switch / dot-sourcing chain is exercised end to end.
