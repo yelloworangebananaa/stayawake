@@ -18,6 +18,10 @@ PAYLOAD=$(cat)
 # POSIX BRE sed extraction (no \+ \s \? \| -- must also run under BSD sed on
 # macOS). A malformed/missing payload must never block the turn: fall back to
 # a placeholder session id and exit 0 regardless of what happens above.
+# This is a greedy text match, not a JSON parse -- [^"]* cannot cross an
+# escaped quote, so it is unreachable through valid JSON containing an
+# escaped `"` inside session_id. Verified, not a live bug; do not "fix" this
+# without a real parser to replace it.
 SESSION=$(printf '%s' "$PAYLOAD" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
 [ -n "$SESSION" ] || SESSION="unknown"
 

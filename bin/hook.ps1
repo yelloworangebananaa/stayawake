@@ -1,4 +1,4 @@
-# usage: hook.ps1 -Event <UserPromptSubmit|Stop|SessionEnd>
+# usage: hook.ps1 -HookEvent <UserPromptSubmit|Stop|SessionEnd>
 # Reads the hook payload on stdin, extracts session_id, and starts or stops a
 # guard. Registered unconditionally alongside the sh command form in
 # hooks/hooks.json (see docs/hook-dispatch.md) -- the OS guard below is what
@@ -6,7 +6,12 @@
 # this dev machine (Git Bash puts sh on PATH), so without this guard every
 # turn would spawn two guards and the refcount would be wrong from the first
 # prompt.
-param([ValidateSet('UserPromptSubmit','Stop','SessionEnd')][string]$Event)
+# Named $HookEvent, not $Event: $Event is a PowerShell automatic variable
+# (used by the eventing subsystem), and PSScriptAnalyzer flags a param that
+# shadows it. Binds correctly either way -- this is just removing the trap
+# for the next reader, not a live bug. hooks/hooks.json's `-Event` call site
+# must be renamed to `-HookEvent` to match.
+param([ValidateSet('UserPromptSubmit','Stop','SessionEnd')][string]$HookEvent)
 
 if ($env:OS -ne 'Windows_NT') { exit 0 }
 
@@ -23,7 +28,7 @@ try {
   # A malformed payload must never block the turn. Fall through with 'unknown'.
 }
 
-switch ($Event) {
+switch ($HookEvent) {
   'UserPromptSubmit' {
     # Find-ClaudePid walks past this short-lived hook process to the actual
     # Claude Code process -- a guard watching the hook's own pid would see
