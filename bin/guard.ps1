@@ -34,8 +34,15 @@ public static extern uint SetThreadExecutionState(uint esFlags);
   # feature, not an oversight.
   function Set-IdleAssertion {
     param([bool]$On)
-    $ES_CONTINUOUS      = [uint32]0x80000000
-    $ES_SYSTEM_REQUIRED = [uint32]0x00000001
+    # PowerShell parses a hex literal as [int] first, and 0x80000000 as an
+    # [int] is -2147483648 -- casting that negative value to [uint32] throws
+    # ("Value was either too large or too small for a UInt32"). The
+    # `-as [uint32]` operator "fixes" this by returning $null instead of
+    # throwing, which is worse: it silently produces an empty flag that then
+    # breaks the -bor below with no error at all. Use the decimal literal,
+    # which PowerShell parses as [long] and casts to [uint32] cleanly.
+    $ES_CONTINUOUS      = [uint32]2147483648 # 0x80000000
+    $ES_SYSTEM_REQUIRED = [uint32]1          # 0x00000001
     if ($On) {
       [SA.Native]::SetThreadExecutionState($ES_CONTINUOUS -bor $ES_SYSTEM_REQUIRED) | Out-Null
     } else {

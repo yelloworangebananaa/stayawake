@@ -36,8 +36,17 @@ switch ($Verb) {
   }
   'on' {
     $parent = Find-ClaudePid -StartPid $PID
+    # Start-Process -ArgumentList (array form) does not reliably quote array
+    # elements containing spaces, and this repository's own path contains
+    # one (".../ryzen 9/..."). Task 9 hit this exact bug -- an unquoted path
+    # element gets split at the space and the child dies before writing
+    # anything, which looks exactly like a guard that silently failed to
+    # start. Pre-quoting the path into its own token (same fix used in
+    # bin/hook.ps1, tests/test_windows_guard.ps1, and lib/windows/setup.ps1's
+    # elevated relaunch) sidesteps that.
+    $guardQ = '"' + (Join-Path $root 'bin\guard.ps1') + '"'
     Start-Process powershell -WindowStyle Hidden -ArgumentList `
-      '-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $root 'bin\guard.ps1'),
+      '-NoProfile','-ExecutionPolicy','Bypass','-File',$guardQ,
       '-SessionId',$SessionId,'-Kind','pin','-ParentPid',$parent | Out-Null
     Write-Host 'stayawake: pinned on for this session.'
   }

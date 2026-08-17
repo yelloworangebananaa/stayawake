@@ -104,4 +104,36 @@ Assert-Eq -Actual (@([regex]::Matches($log,'restore:')).Count) -Expected 1 `
           -Name 'guard restored after parent was force-killed'
 
 Remove-Item $env:STAYAWAKE_HOME -Recurse -Force -ErrorAction SilentlyContinue
+
+# --- real Set-IdleAssertion path (no stub) ---
+# Every test above injects STAYAWAKE_PLATFORM_STUB, which replaces
+# Set-IdleAssertion wholesale -- the real function, and its literal [uint32]
+# flag casts, is never executed by any of them. That gap is exactly how
+# `$ES_CONTINUOUS = [uint32]0x80000000` (throws on every call: PowerShell
+# parses a hex literal as [int] first, and 0x80000000 as an [int] is
+# negative, so the [uint32] cast fails) shipped behind 173 green assertions
+# and crashed the guard on Windows PowerShell 5.1 without ever holding the
+# machine awake. Extract the literal Add-Type + Set-IdleAssertion text
+# straight out of bin/guard.ps1 and evaluate it here, so this test runs the
+# exact source the shipped guard runs -- not a hand-copied stand-in that
+# could drift from it, or paper over the same bug by construction.
+$guardSrc = Get-Content (Join-Path $here '..\bin\guard.ps1') -Raw
+$block = [regex]::Match($guardSrc, '(?s)Add-Type -Namespace SA.*?\n  \}(?=\n\})')
+Assert-Eq -Actual $block.Success -Expected $true -Name 'located the real Set-IdleAssertion block in guard.ps1'
+Invoke-Expression $block.Value
+
+# SetThreadExecutionState is process-local and has no persistent effect --
+# clearing it (the -On $false branch) is exactly what the release path
+# already does on every guard exit, so setting and immediately clearing
+# here leaves the machine exactly as it found it. Safe to call for real.
+try {
+  Set-IdleAssertion -On $true
+  Set-IdleAssertion -On $false
+  Assert-Eq -Actual 'ok' -Expected 'ok' `
+            -Name 'real Set-IdleAssertion calls through SetThreadExecutionState without throwing'
+} catch {
+  Assert-Eq -Actual ('threw: ' + $_.Exception.Message) -Expected 'ok' `
+            -Name 'real Set-IdleAssertion calls through SetThreadExecutionState without throwing'
+}
+
 Complete-Tests
