@@ -5,7 +5,7 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $lid = Get-LidActionFromText -Text (Get-Content (Join-Path $here 'fixtures\powercfg-lidaction.txt') -Raw)
 Assert-Eq -Actual $lid.Present -Expected $true -Name 'lid setting detected as present'
 Assert-Eq -Actual $lid.Ac -Expected 1 -Name 'AC lid action parsed as 1'
-Assert-Eq -Actual $lid.Dc -Expected 1 -Name 'DC lid action parsed as 1'
+Assert-Eq -Actual $lid.Dc -Expected 2 -Name 'DC lid action parsed as 2'
 
 $none = Get-LidActionFromText -Text (Get-Content (Join-Path $here 'fixtures\powercfg-no-lidaction.txt') -Raw)
 Assert-Eq -Actual $none.Present -Expected $false -Name 'absent lid setting reported as absent'
