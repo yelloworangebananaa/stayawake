@@ -100,26 +100,70 @@ is the only task that runs unattended, and it's unprivileged.
 
 ## How to remove it by hand
 
-If `/stayawake uninstall` isn't available or you'd rather do it yourself:
+**Do this first, on either platform:** uninstall the plugin.
+
+```
+/plugin uninstall stayawake@stayawake
+```
+
+While the plugin is installed its hooks run on every turn, and each turn
+re-applies the lid override. Cleaning up before stopping the hooks
+accomplishes nothing — the next prompt puts it straight back.
+
+**Order matters below: restore the power setting *before* deleting
+`~/.stayawake`.** That directory holds `original.state`, which is the only
+record of what your setting was. Delete it first and the override becomes
+permanent with nothing left to restore from.
 
 **macOS**
 ```
+# 1. see what your original setting was
+cat ~/.stayawake/original.state
+
+# 2. restore it (the value from disablesleep=N above; 0 is the normal default)
+sudo pmset -a disablesleep 0
+
+# 3. remove the grant and the login agent
 sudo rm /etc/sudoers.d/stayawake
 launchctl unload ~/Library/LaunchAgents/com.stayawake.restore.plist
 rm ~/Library/LaunchAgents/com.stayawake.restore.plist
+
+# 4. only now, remove the state
 rm -rf ~/.stayawake
 ```
 
-**Windows**
-```
-Unregister-ScheduledTask -TaskPath '\StayAwake\' -TaskName 'Disable' -Confirm:$false
-Unregister-ScheduledTask -TaskPath '\StayAwake\' -TaskName 'Restore' -Confirm:$false
-Unregister-ScheduledTask -TaskPath '\StayAwake\' -TaskName 'BootRestore' -Confirm:$false
+**Windows — must be an elevated PowerShell.** The tasks are registered with
+`RunLevel Highest`; removing them from a normal shell fails with access
+denied.
+
+```powershell
+# 1. see what your original setting was (lidAc=N;lidDc=N)
+Get-Content "$env:USERPROFILE\.stayawake\original.state"
+
+# 2. remove the tasks first, so nothing can re-apply the override mid-cleanup
+Get-ScheduledTask -TaskPath '\StayAwake\' | Unregister-ScheduledTask -Confirm:$false
+
+# 3. restore the lid-close setting (use your values from step 1; 1 = Sleep)
+$sub  = '4f971e89-eebd-4455-a8de-9e59040e7347'
+$lid  = '5ca83367-6e45-459f-a27b-476b1d01c936'
+powercfg /setacvalueindex SCHEME_CURRENT $sub $lid 1
+powercfg /setdcvalueindex SCHEME_CURRENT $sub $lid 1
+powercfg /setactive SCHEME_CURRENT
+
+# 4. only now, remove the state
 Remove-Item "$env:USERPROFILE\.stayawake" -Recurse -Force
 ```
 
-This restores any power setting stayawake currently has applied before
-removing its state, the same way `/stayawake uninstall` does.
+Verify afterwards that the lid setting is back to what step 1 showed:
+
+```powershell
+powercfg /query SCHEME_CURRENT 4f971e89-eebd-4455-a8de-9e59040e7347 5ca83367-6e45-459f-a27b-476b1d01c936 |
+  Select-String 'Current AC|Current DC'
+```
+
+Unlike `/stayawake uninstall`, these steps do **not** restore the setting for
+you — you are doing it by hand in step 2/3, which is exactly why the order
+above matters.
 
 ## Limits
 
